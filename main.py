@@ -13,7 +13,7 @@ app = FastAPI(title="妖股雷达")
 # 基础配置
 # =========================
 
-EASTMONEY_URL = "https://push2.eastmoney.com/api/qt/clist/get"
+EASTMONEY_URL = "https://82.push2.eastmoney.com/api/qt/clist/get"
 
 CACHE = {
     "time": 0,
@@ -131,6 +131,7 @@ def fetch_market():
     params = {
         "pn": 1,
         "pz": 1000,
+        "ut": "bd1d9ddb04089700cf9c27f6f7426281",
         "po": 1,
         "np": 1,
         "fltt": 2,
@@ -235,7 +236,6 @@ def get_market_data():
 
     now = time.time()
 
-    # 15秒缓存，避免反复请求
     if (
         CACHE["data"]
         and now - CACHE["time"] < CACHE_SECONDS
@@ -258,7 +258,6 @@ def get_market_data():
 
         print("行情接口异常：", e)
 
-    # 接口异常
     CACHE["time"] = now
     CACHE["data"] = FALLBACK_DATA
     CACHE["source"] = "演示数据"
