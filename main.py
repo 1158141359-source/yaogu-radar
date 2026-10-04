@@ -1,858 +1,425 @@
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse
-from datetime import datetime, timedelta
-from urllib.request import Request, urlopen
-from urllib.parse import urlencode
-import json
-import time
+import os
 import html
+import time
+import requests
 
 app = FastAPI(title="妖股雷达")
 
-# ============================================================
-# 东方财富接口
-# ============================================================
+# 妙想 mx-xuangu 官方接口
+MX_URL = "https://mkapi2.dfcfs.com/finskillshub/api/claw/stock-screen"
 
-EM_HOSTS = [
-    "https://push2ex.eastmoney.com",
-    "https://push2delay.eastmoney.com",
-    "https://push2.eastmoney.com",
-    "https://82.push2.eastmoney.com",
-]
+CACHE = {"ts": 0, "data": [], "source": "未连接"}
+CACHE_SECONDS = 60
 
-DC_URL = "https://datacenter-web.eastmoney.com/api/data/v1/get"
+QUERY = """
+筛选A股，严格满足以下硬条件：
+1. 最近3个交易日内至少有1次涨停；
+2. 最近交易日上过龙虎榜；
+3. 总市值不超过300亿元；
+4. 排除ST、*ST、退市整理股票。
 
-UT = "bd1d9ddb04089700cf9c27f6f7426281"
+请返回尽可能完整的股票数据，包括：
+股票代码、股票简称、最新价、涨跌幅、换手率、总市值、
+龙虎榜净买额、最近3个交易日涨停次数、集合竞价委买金额、
+集合竞价委卖金额。
 
-CACHE = {
-    "ts": 0,
-    "data": [],
-    "source": "未连接",
-}
-
-CACHE_SECONDS = 20
-
-
-# ============================================================
-# 基础函数
-# ============================================================
+在满足硬条件的股票中，优先返回涨跌幅、换手率、
+龙虎榜资金强度和近3日涨停次数较高的股票。
+"""
 
 def num(v, default=0.0):
     try:
-        if v in (None, "", "-"):
+        if v in (None, "", "-", "--", "—"):
             return default
-        return float(v)
+        return float(str(v).replace(",", "").replace("%", "").strip())
     except Exception:
         return default
 
+def pick(row, *names):
+    for name in names:
+        if name in row and row[name] not in (None, ""):
+            return row[name]
 
-def get_json(url, params=None, timeout=10):
-    full_url = url
+    for k, v in row.items():
+        if v in (None, ""):
+            continue
+        for name in names:
+            if str(name).lower() in str(k).lower():
+                return v
 
-    if params:
-        full_url += "?" + urlencode(params)
+    return ""
 
-    last_error = None
-
-    for _ in range(2):
-        try:
-            req = Request(
-                full_url,
-                headers={
-                    "User-Agent": (
-                        "Mozilla/5.0 "
-                        "(iPhone; CPU iPhone OS 17_0 like Mac OS X) "
-                        "AppleWebKit/605.1.15 "
-                        "Mobile/15E148"
-                    ),
-                    "Referer": "https://quote.eastmoney.com/",
-                    "Accept": "application/json,text/plain,*/*",
-                },
-            )
-
-            with urlopen(req, timeout=timeout) as response:
-                raw = response.read().decode(
-                    "utf-8",
-                    "ignore"
-                )
-
-            return json.loads(raw)
-
-        except Exception as e:
-            last_error = e
-            time.sleep(0.3)
-
-    raise last_error
-
-
-# ============================================================
-# 东方财富：涨停池
-# ============================================================
-
-def get_limit_up_pool(date_string):
-    params = {
-        "ut": "7eea3edcaed734bea9cbfc24409ed989",
-        "dpt": "wz.ztzt",
-        "Pageindex": 0,
-        "pagesize": 200,
-        "sort": "fbt:asc",
-        "date": date_string,
-    }
-
-    try:
-        result = get_json(
-            EM_HOSTS[0] + "/getTopicZTPool",
-            params,
-            10,
+def extract_rows(obj):
+    if obj.get("status") != 0:
+        raise RuntimeError(
+            f"妙想接口错误：{obj.get('message', obj.get('status'))}"
         )
 
-        data = result.get("data") or {}
+    outer = obj.get("data") or {}
+    inner = outer.get("data") or {}
 
-        return data.get("pool") or []
+    result = (
+        (inner.get("allResults") or {})
+        .get("result") or {}
+    )
 
-    except Exception as e:
-        print("涨停池异常:", repr(e))
+    rows = result.get("dataList") or []
+
+    if isinstance(rows, list) and rows:
+        return rows
+
+    partial = inner.get("partialResults") or ""
+
+    if not partial:
         return []
 
+    lines = [
+        x.strip()
+        for x in str(partial).splitlines()
+        if x.strip().startswith("|")
+    ]
 
-# ============================================================
-# 东方财富：龙虎榜
-# ============================================================
+    if len(lines) < 3:
+        return []
 
-def get_lhb(date_string):
-    params = {
-        "reportName":
-            "RPT_DAILYBILLBOARD_DETAILSNEW",
+    def cells(line):
+        return [x.strip() for x in line.strip("|").split("|")]
 
-        "columns":
-            "SECURITY_CODE,"
-            "SECURITY_NAME_ABBR,"
-            "CHANGE_RATE,"
-            "BILLBOARD_NET_AMT,"
-            "BILLBOARD_BUY_AMT,"
-            "BILLBOARD_SELL_AMT,"
-            "DEAL_AMOUNT_RATIO,"
-            "EXPLANATION,"
-            "TRADE_DATE",
+    headers = cells(lines[0])
+    rows = []
 
-        "pageNumber": 1,
-        "pageSize": 500,
+    for line in lines[2:]:
+        values = cells(line)
 
-        "sortColumns":
-            "BILLBOARD_NET_AMT",
-
-        "sortTypes": "-1",
-
-        "source": "WEB",
-        "client": "WEB",
-
-        "filter":
-            f"(TRADE_DATE='{date_string}')",
-    }
-
-    result = get_json(
-        DC_URL,
-        params,
-        12,
-    )
-
-    return (
-        (result.get("result") or {})
-        .get("data")
-        or []
-    )
-
-
-# ============================================================
-# 东方财富：实时行情
-# ============================================================
-
-def get_market():
-    params = {
-        "pn": 1,
-        "pz": 5000,
-
-        "ut": UT,
-
-        "po": 1,
-        "np": 1,
-
-        "fltt": 2,
-        "invt": 2,
-
-        "fid": "f3",
-
-        # 沪A + 深A + 创业板 + 科创板
-        "fs":
-            "m:0+t:6,"
-            "m:0+t:80,"
-            "m:1+t:2,"
-            "m:1+t:23",
-
-        # 代码、名称、价格、涨幅、
-        # 成交额、换手率、量比、市值
-        "fields":
-            "f12,f14,f2,f3,f6,f8,f10,f20,f21",
-    }
-
-    last_error = None
-
-    for host in EM_HOSTS[1:]:
-
-        try:
-
-            result = get_json(
-                host + "/api/qt/clist/get",
-                params,
-                12,
-            )
-
-            diff = (
-                (result.get("data") or {})
-                .get("diff")
-                or []
-            )
-
-            if isinstance(diff, dict):
-                diff = list(diff.values())
-
-            if diff:
-                return diff
-
-        except Exception as e:
-
-            last_error = e
-
-    raise last_error or Exception(
-        "东方财富行情接口不可用"
-    )
-
-
-# ============================================================
-# 单只股票盘口
-# ============================================================
-
-def get_stock_quote(code):
-
-    market_code = (
-        "1"
-        if code.startswith(("6", "68"))
-        else "0"
-    )
-
-    params = {
-        "ut": UT,
-        "fltt": 2,
-        "invt": 2,
-
-        "secid":
-            f"{market_code}.{code}",
-
-        "fields":
-            "f43,f47,f48,f50,f57,f58,"
-            "f116,f117,f168,f170,"
-            "f31,f32,f33,f34,f35,f36,"
-            "f37,f38,f39,f40,"
-            "f19,f20,f17,f18,"
-            "f15,f16,f13,f14,f11,f12",
-    }
-
-    for host in EM_HOSTS[1:]:
-
-        try:
-
-            result = get_json(
-                host + "/api/qt/stock/get",
-                params,
-                8,
-            )
-
-            return result.get("data") or {}
-
-        except Exception:
-            pass
-
-    return {}
-
-
-# ============================================================
-# 找近3个交易日涨停股票
-# ============================================================
-
-def get_recent_limit_up():
-
-    today = datetime.now().date()
-
-    found = {}
-
-    checked_days = 0
-
-    # 向前查最多9个自然日，
-    # 找到最近3个有涨停池数据的交易日
-    for i in range(9):
-
-        day = today - timedelta(days=i)
-
-        date_string = day.strftime("%Y%m%d")
-
-        pool = get_limit_up_pool(
-            date_string
-        )
-
-        if not pool:
+        if len(values) != len(headers):
             continue
 
-        checked_days += 1
+        rows.append(dict(zip(headers, values)))
 
-        for item in pool:
+    return rows
 
-            code = str(
-                item.get("c") or ""
-            )
+def normalize(rows):
+    result = []
 
-            if not code:
-                continue
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
 
-            if code not in found:
-                found[code] = []
+        code = str(pick(
+            row,
+            "SECURITY_CODE",
+            "股票代码",
+            "证券代码",
+            "代码"
+        )).strip()
 
-            found[code].append(
-                date_string
-            )
-
-        if checked_days >= 3:
-            break
-
-    return found
-
-
-# ============================================================
-# 妖股评分
-# ============================================================
-
-def calculate_score(stock):
-
-    score = 40
-
-    pct = stock["pct"]
-    turnover = stock["turnover"]
-    lhb_net = stock["lhb_net"]
-
-    # --------------------------------------------------------
-    # 涨幅
-    # --------------------------------------------------------
-
-    if pct >= 5:
-        score += 10
-
-    if pct >= 7:
-        score += 5
-
-    if pct >= 9.5:
-        score += 5
-
-    # --------------------------------------------------------
-    # 竞价/早盘换手
-    # --------------------------------------------------------
-
-    if turnover > 29.25:
-        score += 15
-
-    elif turnover > 15:
-        score += 8
-
-    elif turnover > 8:
-        score += 4
-
-    # --------------------------------------------------------
-    # 龙虎榜净买
-    # --------------------------------------------------------
-
-    if lhb_net > 0:
-        score += 10
-
-    elif lhb_net < 0:
-        score += 3
-
-    # --------------------------------------------------------
-    # 近3日涨停次数
-    # --------------------------------------------------------
-
-    zt_count = len(
-        stock["zt_dates"]
-    )
-
-    if zt_count >= 2:
-        score += 10
-
-    elif zt_count == 1:
-        score += 5
-
-    # --------------------------------------------------------
-    # 委卖 > 委买
-    # --------------------------------------------------------
-
-    if stock["sell"] > stock["buy"]:
-        score += 10
-
-    return min(
-        100,
-        round(score)
-    )
-
-
-# ============================================================
-# 核心选股
-# ============================================================
-
-def scan():
-
-    market = get_market()
-
-    recent_zt = get_recent_limit_up()
-
-    if not recent_zt:
-
-        raise Exception(
-            "近3个交易日涨停池暂无数据"
-        )
-
-    # --------------------------------------------------------
-    # 获取最近龙虎榜
-    # --------------------------------------------------------
-
-    latest_lhb = {}
-
-    for i in range(8):
-
-        date_string = (
-            datetime.now().date()
-            - timedelta(days=i)
-        ).strftime("%Y-%m-%d")
-
-        try:
-
-            rows = get_lhb(
-                date_string
-            )
-
-            for row in rows:
-
-                code = str(
-                    row.get(
-                        "SECURITY_CODE"
-                    )
-                    or ""
-                )
-
-                if (
-                    code
-                    and code not in latest_lhb
-                ):
-                    latest_lhb[code] = row
-
-        except Exception as e:
-
-            print(
-                "龙虎榜异常:",
-                repr(e)
-            )
-
-        if latest_lhb:
-            break
-
-    results = []
-
-    # --------------------------------------------------------
-    # 硬条件：
-    # 1. 近3交易日涨停
-    # 2. 龙虎榜
-    # 3. 市值 <= 300亿
-    # --------------------------------------------------------
-
-    for item in market:
-
-        code = str(
-            item.get("f12") or ""
-        )
-
-        name = str(
-            item.get("f14") or ""
-        )
+        name = str(pick(
+            row,
+            "SECURITY_SHORT_NAME",
+            "SECURITY_NAME_ABBR",
+            "股票简称",
+            "证券简称",
+            "名称"
+        )).strip()
 
         if not code or not name:
             continue
 
-        upper_name = name.upper()
+        upper = name.upper()
 
-        if "ST" in upper_name:
+        if "ST" in upper or name.startswith("退"):
             continue
 
-        if name.startswith("退"):
-            continue
+        price = num(pick(
+            row,
+            "NEWEST_PRICE",
+            "最新价",
+            "现价"
+        ))
 
-        # 硬条件1：近3日涨停
-        if code not in recent_zt:
-            continue
+        pct = num(pick(
+            row,
+            "CHG",
+            "涨跌幅",
+            "今日涨跌幅",
+            "涨幅"
+        ))
 
-        # 市值
-        market_cap = num(
-            item.get("f20")
-        )
+        turnover = num(pick(
+            row,
+            "TURNOVER_RATE",
+            "换手率",
+            "今日换手率",
+            "HSL"
+        ))
 
-        # 硬条件3：<=300亿
-        if (
-            market_cap <= 0
-            or market_cap > 30_000_000_000
-        ):
-            continue
+        cap = num(pick(
+            row,
+            "TOTAL_MARKET_CAP",
+            "TOTAL_MV",
+            "总市值",
+            "总市值(元)",
+            "市值"
+        ))
 
-        # 硬条件2：龙虎榜
-        lhb_row = latest_lhb.get(code)
-
-        if not lhb_row:
-            continue
-
-        quote = get_stock_quote(code)
-
-        price = num(
-            quote.get("f43"),
-            num(item.get("f2"))
-        )
-
-        pct = num(
-            quote.get("f170"),
-            num(item.get("f3"))
-        )
-
-        turnover = num(
-            quote.get("f168"),
-            num(item.get("f8"))
-        )
-
-        # ----------------------------------------------------
-        # 委买/委卖估算
-        # ----------------------------------------------------
-
-        buy = sum(
-            num(quote.get(k))
-            for k in (
-                "f20",
-                "f18",
-                "f16",
-                "f14",
-                "f12",
-            )
-        )
-
-        sell = sum(
-            num(quote.get(k))
-            for k in (
-                "f40",
-                "f38",
-                "f36",
-                "f34",
-                "f32",
-            )
-        )
-
-        # ----------------------------------------------------
-        # 龙虎榜净买额
-        # ----------------------------------------------------
-
-        lhb_net = (
-            num(
-                lhb_row.get(
-                    "BILLBOARD_NET_AMT"
-                )
-            )
-            / 100000000
-        )
-
-        stock = {
-
-            "code": code,
-
-            "name": name,
-
-            "price": price,
-
-            "pct": pct,
-
-            "turnover": turnover,
-
-            "market_cap":
-                market_cap / 100000000,
-
-            "lhb_net":
-                lhb_net,
-
-            "buy": buy,
-
-            "sell": sell,
-
-            "zt_dates":
-                recent_zt[code],
-        }
-
-        stock["score"] = (
-            calculate_score(stock)
-        )
-
-        if stock["score"] >= 80:
-
-            stock["state"] = "高概率"
-
-        elif stock["score"] >= 70:
-
-            stock["state"] = "强势"
-
+        if cap > 100000:
+            cap_yi = cap / 100000000
         else:
+            cap_yi = cap
 
-            stock["state"] = "观察"
+        lhb = num(pick(
+            row,
+            "BILLBOARD_NET_AMT",
+            "龙虎榜净买额",
+            "龙虎榜净额",
+            "龙虎榜净买"
+        ))
 
-        results.append(stock)
+        if abs(lhb) > 1000:
+            lhb_yi = lhb / 100000000
+        else:
+            lhb_yi = lhb
 
-    # --------------------------------------------------------
-    # 排序
-    # --------------------------------------------------------
+        zt_count = int(num(pick(
+            row,
+            "LIMIT_UP_COUNT_3D",
+            "近3日涨停次数",
+            "近3个交易日涨停次数",
+            "涨停次数"
+        )))
 
-    results.sort(
+        buy = num(pick(
+            row,
+            "BID_AMOUNT",
+            "委买金额",
+            "竞价委买",
+            "集合竞价委买"
+        ))
+
+        sell = num(pick(
+            row,
+            "ASK_AMOUNT",
+            "委卖金额",
+            "竞价委卖",
+            "集合竞价委卖"
+        ))
+
+        # 妖股评分
+        score = 40
+
+        if pct >= 5:
+            score += 10
+
+        if pct >= 7:
+            score += 5
+
+        if pct >= 9.5:
+            score += 5
+
+        if turnover > 29.25:
+            score += 15
+        elif turnover > 15:
+            score += 8
+        elif turnover > 8:
+            score += 4
+
+        if lhb_yi > 0:
+            score += 10
+        elif lhb_yi < 0:
+            score += 3
+
+        if zt_count >= 2:
+            score += 10
+        elif zt_count == 1:
+            score += 5
+
+        if sell > buy:
+            score += 10
+
+        result.append({
+            "code": code,
+            "name": name,
+            "price": price,
+            "pct": pct,
+            "turnover": turnover,
+            "market_cap": cap_yi,
+            "lhb_net": lhb_yi,
+            "zt_count": zt_count,
+            "buy": buy,
+            "sell": sell,
+            "score": min(100, int(score))
+        })
+
+    result.sort(
         key=lambda x: (
             x["score"],
-            x["lhb_net"],
             x["pct"],
+            x["lhb_net"]
         ),
-        reverse=True,
+        reverse=True
     )
 
-    return results[:50]
+    return result[:50]
 
+def query_miaoxiang():
+    api_key = os.getenv("MX_APIKEY")
 
-# ============================================================
-# 缓存
-# ============================================================
+    if not api_key:
+        raise RuntimeError("MX_APIKEY 未设置")
+
+    response = requests.post(
+        MX_URL,
+        headers={
+            "Content-Type": "application/json",
+            "apikey": api_key
+        },
+        json={
+            "keyword": QUERY
+        },
+        timeout=35
+    )
+
+    response.raise_for_status()
+
+    return response.json()
 
 def get_data():
-
     now = time.time()
 
     if (
         CACHE["data"]
-        and now - CACHE["ts"]
-        < CACHE_SECONDS
+        and now - CACHE["ts"] < CACHE_SECONDS
     ):
-
-        return (
-            CACHE["data"],
-            CACHE["source"],
-        )
+        return CACHE["data"], CACHE["source"]
 
     try:
-
-        data = scan()
+        raw = query_miaoxiang()
+        rows = extract_rows(raw)
+        data = normalize(rows)
 
         CACHE["ts"] = now
-
         CACHE["data"] = data
+        CACHE["source"] = "东方财富妙想智能选股 API"
 
-        CACHE["source"] = (
-            "东方财富：行情 + 涨停池 + 龙虎榜"
-        )
-
-        return (
-            data,
-            CACHE["source"],
-        )
+        return data, CACHE["source"]
 
     except Exception as e:
-
-        print(
-            "SCANNER_ERROR:",
-            repr(e)
-        )
-
-        # 重要：
-        # 不再使用假股票作为演示数据
         CACHE["ts"] = now
         CACHE["data"] = []
+        CACHE["source"] = "接口异常：" + str(e)[:180]
 
-        CACHE["source"] = (
-            "接口异常：" + str(e)[:120]
-        )
+        print("MIAOXIANG_ERROR:", repr(e))
 
-        return (
-            [],
-            CACHE["source"],
-        )
-
-
-# ============================================================
-# API
-# ============================================================
+        return [], CACHE["source"]
 
 @app.get("/api/health")
 def health():
-
     return {
         "status": "ok",
-        "time":
-            datetime.now().isoformat(),
+        "mx_apikey_configured": bool(
+            os.getenv("MX_APIKEY")
+        )
     }
-
 
 @app.get("/api/scanner")
 def scanner():
-
     data, source = get_data()
 
     return {
-
         "status": "ok",
-
         "source": source,
-
-        "updated_at":
-            datetime.now().strftime(
-                "%Y-%m-%d %H:%M:%S"
-            ),
-
-        "top3":
-            data[:3],
-
-        "data":
-            data,
+        "updated_at": time.strftime(
+            "%Y-%m-%d %H:%M:%S"
+        ),
+        "top3": data[:3],
+        "data": data
     }
 
-
-# ============================================================
-# 网页
-# ============================================================
-
-@app.get(
-    "/",
-    response_class=HTMLResponse
-)
+@app.get("/", response_class=HTMLResponse)
 def home():
-
     data, source = get_data()
-
     top3 = data[:3]
 
-    # --------------------------------------------------------
-    # TOP 3
-    # --------------------------------------------------------
-
     if top3:
-
-        top_html = ""
+        cards = ""
 
         for i, x in enumerate(top3):
+            cards += f"""
+            <div class="card">
+                <div class="rank">#{i + 1}</div>
 
-            top_html += f"""
-            <div class="top-card">
-
-                <div class="rank">
-                    #{i + 1}
-                </div>
-
-                <div class="top-name">
+                <div class="name">
                     {html.escape(x["name"])}
                 </div>
 
-                <div class="top-code">
-                    {x["code"]}
+                <div class="code">
+                    {html.escape(x["code"])}
                 </div>
 
-                <div class="prob">
+                <div class="bigscore">
                     {x["score"]}
-                    <span>分</span>
-                </div>
-
-                <div class="pct">
-                    {x["pct"]:+.2f}%
+                    <small>分</small>
+                    <span>{x["pct"]:+.2f}%</span>
                 </div>
 
                 <div class="detail">
                     市值 {x["market_cap"]:.1f}亿
-                    · 龙虎榜净额
-                    {x["lhb_net"]:+.2f}亿
-                    · 近3日涨停
-                    {len(x["zt_dates"])}次
+                    · 龙虎榜 {x["lhb_net"]:+.2f}亿
+                    · 近3日涨停 {x["zt_count"]}次
                 </div>
-
             </div>
             """
 
     else:
-
-        top_html = """
+        cards = """
         <div class="empty">
-            当前没有同时满足全部硬条件的股票
+            当前没有返回同时满足全部硬条件的股票
         </div>
         """
 
-    # --------------------------------------------------------
-    # 表格
-    # --------------------------------------------------------
-
-    rows_html = ""
+    rows = ""
 
     for x in data:
-
-        rows_html += f"""
+        rows += f"""
         <tr>
-
-            <td>{x["code"]}</td>
+            <td>{html.escape(x["code"])}</td>
 
             <td>
                 <b>{html.escape(x["name"])}</b>
             </td>
 
-            <td>
-                {x["price"]:.2f}
-            </td>
+            <td>{x["price"]:.2f}</td>
 
             <td class="up">
                 {x["pct"]:+.2f}%
             </td>
 
-            <td>
-                {x["turnover"]:.2f}%
-            </td>
+            <td>{x["turnover"]:.2f}%</td>
 
-            <td>
-                {x["market_cap"]:.1f}亿
-            </td>
+            <td>{x["market_cap"]:.1f}亿</td>
 
-            <td>
-                {x["lhb_net"]:+.2f}亿
-            </td>
+            <td>{x["lhb_net"]:+.2f}亿</td>
 
-            <td>
-                {len(x["zt_dates"])}次
-            </td>
+            <td>{x["zt_count"]}次</td>
 
-            <td>
-                <span class="score">
-                    {x["score"]}
-                </span>
+            <td class="score">
+                {x["score"]}
             </td>
-
         </tr>
         """
 
-    if not rows_html:
-
-        rows_html = """
+    if not rows:
+        rows = """
         <tr>
             <td colspan="9" class="empty">
-                暂无符合全部硬条件的股票
+                暂无符合全部硬条件的数据
             </td>
         </tr>
         """
 
-    updated = datetime.now().strftime(
+    updated = time.strftime(
         "%Y-%m-%d %H:%M:%S"
     )
 
@@ -868,8 +435,8 @@ def home():
 <meta
     name="viewport"
     content="width=device-width,
-             initial-scale=1,
-             maximum-scale=1"
+    initial-scale=1,
+    maximum-scale=1"
 >
 
 <meta
@@ -877,271 +444,168 @@ def home():
     content="60"
 >
 
-<title>妖股雷达</title>
+<title>🔥 妖股雷达</title>
 
 <style>
 
 * {{
-    box-sizing:border-box;
+    box-sizing:border-box
 }}
 
 body {{
-
     margin:0;
-
     background:#070b11;
-
     color:#edf2f8;
-
     font-family:
         -apple-system,
         BlinkMacSystemFont,
         "PingFang SC",
         "Microsoft YaHei",
-        sans-serif;
+        sans-serif
 }}
 
 .wrap {{
-
     max-width:1200px;
-
     margin:auto;
-
-    padding:18px 12px;
+    padding:16px 10px
 }}
 
 h1 {{
-
     margin:0;
-
-    font-size:27px;
+    font-size:25px
 }}
 
 .sub {{
-
-    margin-top:7px;
-
-    margin-bottom:14px;
-
     color:#8390a3;
-
-    line-height:1.6;
+    line-height:1.7;
+    margin:7px 0 12px
 }}
 
 .status {{
-
     display:inline-block;
-
     padding:7px 10px;
-
     border-radius:9px;
-
     background:#111b25;
-
     border:1px solid #263443;
-
     color:#62e59a;
-
     font-size:12px;
-
-    margin-bottom:14px;
+    margin-bottom:12px
 }}
 
 .tops {{
-
     display:grid;
-
     grid-template-columns:
         repeat(3,1fr);
-
     gap:10px;
-
-    margin-bottom:14px;
+    margin-bottom:12px
 }}
 
-.top-card,
+.card,
 .box {{
-
     background:#101722;
-
     border:1px solid #202d3c;
-
-    border-radius:14px;
+    border-radius:14px
 }}
 
-.top-card {{
-
-    padding:15px;
-
-    position:relative;
+.card {{
+    padding:14px
 }}
 
-.rank {{
-
+.rank,
+.code,
+.detail {{
     color:#7f8da1;
-
-    font-size:12px;
+    font-size:12px
 }}
 
-.top-name {{
-
-    font-size:20px;
-
+.name {{
+    font-size:19px;
     font-weight:700;
-
-    margin-top:5px;
+    margin-top:4px
 }}
 
-.top-code {{
-
-    color:#7f8da1;
-
-    font-size:12px;
-
-    margin-top:3px;
-}}
-
-.prob {{
-
-    display:inline-block;
-
-    margin-top:12px;
-
-    font-size:31px;
-
-    font-weight:800;
-
+.bigscore {{
     color:#ffb54a;
+    font-size:28px;
+    font-weight:800;
+    margin-top:10px
 }}
 
-.prob span {{
-
-    font-size:13px;
-
-    font-weight:400;
+.bigscore small {{
+    font-size:12px;
+    font-weight:400
 }}
 
-.pct {{
-
-    display:inline-block;
-
-    margin-left:10px;
-
+.bigscore span {{
     color:#ff4d67;
-
-    font-size:18px;
-
-    font-weight:700;
+    font-size:17px;
+    margin-left:8px
 }}
 
 .detail {{
-
-    margin-top:8px;
-
-    color:#8190a4;
-
-    font-size:12px;
-
-    line-height:1.6;
+    margin-top:7px;
+    line-height:1.6
 }}
 
 .box {{
-
-    overflow:auto;
+    overflow:auto
 }}
 
 table {{
-
     width:100%;
-
     min-width:900px;
-
-    border-collapse:collapse;
+    border-collapse:collapse
 }}
 
 th,
 td {{
-
-    padding:12px 10px;
-
-    border-bottom:
-        1px solid #202d3c;
-
-    text-align:left;
+    padding:11px 9px;
+    border-bottom:1px solid #202d3c;
+    text-align:left
 }}
 
 th {{
-
     color:#8795a9;
-
-    font-size:12px;
-
-    font-weight:500;
+    font-size:12px
 }}
 
 td {{
-
-    font-size:13px;
+    font-size:13px
 }}
 
 .up {{
-
     color:#ff4d67;
-
-    font-weight:700;
+    font-weight:700
 }}
 
 .score {{
-
     color:#ffb54a;
-
     font-size:17px;
-
-    font-weight:800;
+    font-weight:800
 }}
 
 .empty {{
-
-    padding:30px;
-
+    padding:28px;
     text-align:center;
-
-    color:#7f8da1;
+    color:#7f8da1
 }}
 
 .note {{
-
-    margin-top:12px;
-
+    margin-top:10px;
     color:#69778b;
-
     font-size:12px;
-
-    line-height:1.8;
+    line-height:1.8
 }}
 
 @media(max-width:700px) {{
 
     .tops {{
-
-        grid-template-columns:1fr;
+        grid-template-columns:1fr
     }}
 
     h1 {{
-
-        font-size:23px;
+        font-size:23px
     }}
-
-    .wrap {{
-
-        padding:15px 10px;
-    }}
-
-    .top-name {{
-
-        font-size:19px;
-    }}
-
 }}
 
 </style>
@@ -1164,8 +628,10 @@ td {{
 <br>
 
 评分：
-涨幅 + 换手率 + 龙虎榜净额 +
-近3日涨停次数 + 委买委卖强弱
+涨幅 + 换手率 +
+龙虎榜净额 +
+近3日涨停次数 +
+委买委卖强弱
 
 </div>
 
@@ -1177,7 +643,7 @@ td {{
 
 <div class="tops">
 
-{top_html}
+{cards}
 
 </div>
 
@@ -1188,32 +654,22 @@ td {{
 <thead>
 
 <tr>
-
 <th>代码</th>
-
 <th>名称</th>
-
 <th>现价</th>
-
 <th>涨幅</th>
-
 <th>换手</th>
-
 <th>市值</th>
-
 <th>龙虎榜净额</th>
-
 <th>近3日涨停</th>
-
-<th>妖股概率</th>
-
+<th>妖股评分</th>
 </tr>
 
 </thead>
 
 <tbody>
 
-{rows_html}
+{rows}
 
 </tbody>
 
@@ -1223,22 +679,20 @@ td {{
 
 <div class="note">
 
-更新时间：
-{updated}
+更新时间：{updated}
 
 <br>
 
-数据：
-东方财富公开行情、涨停池、龙虎榜接口
+数据源：
+东方财富妙想智能选股 API
 
 <br>
 
-竞价历史快照如果接口没有提供，
-系统不会伪造数据；可取得的早盘盘口数据参与评分。
+每60秒自动刷新
 
 <br>
 
-⚠️ 妖股概率为量化筛选评分，仅用于研究，
+⚠️ 妖股评分仅用于量化筛选和研究，
 不构成投资建议。
 
 </div>
@@ -1250,10 +704,13 @@ td {{
 </html>
 """
 
+if __name__ == "__main__":
+    import uvicorn
 
-# ============================================================
-# 启动
-# ============================================================
-
-# Render 使用 Dockerfile 中的 uvicorn 启动：
-# uvicorn main:app --host 0.0.0.0 --port $PORT
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=int(
+            os.getenv("PORT", "10000")
+        )
+    )
