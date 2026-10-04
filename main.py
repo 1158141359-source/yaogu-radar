@@ -10,191 +10,136 @@ app = FastAPI(title="妖股雷达")
 
 MX_URL = "https://mkapi2.dfcfs.com/finskillshub/api/claw/stock-screen"
 
-CACHE = {
-    "ts": 0,
-    "data": [],
-    "source": "未连接"
-}
-
+CACHE = {"ts": 0, "data": [], "source": "未连接"}
 CACHE_SECONDS = 60
 
+# 不在这里写死硬条件，让妙想先返回尽可能完整的候选数据
 QUERY = """
-筛选A股，只返回真正满足以下硬条件的股票：
+你是A股量化选股数据助手。
 
-1. 最近3个交易日内至少有1次涨停；
-2. 最近交易日上过龙虎榜；
-3. 总市值不超过300亿元；
+请查询今天A股市场，返回尽可能多的活跃股票候选，至少返回50只。
+
+优先选择：
+1. 最近3个交易日出现过涨停的股票；
+2. 最近交易日出现过龙虎榜的股票；
+3. 总市值300亿元以内的股票；
 4. 排除ST、*ST、退市整理股票。
 
-请务必返回以下字段，而且不要省略：
+请务必返回真实数据，不要编造。
 
+每只股票必须尽可能提供以下字段：
 股票代码
 股票简称
 最新价
 涨跌幅
 换手率
 总市值
-是否上龙虎榜
 龙虎榜净买额
-最近3个交易日涨停次数
+近3个交易日涨停次数
 集合竞价委买金额
 集合竞价委卖金额
 
-字段必须尽量使用明确的数字，不要只给文字描述。
-
 特别注意：
-- 龙虎榜净买额请给出实际金额；
-- 总市值请给出实际金额；
-- 最近3个交易日涨停次数请给出数字；
-- 如果龙虎榜净买额为负数，也必须返回负数；
-- 不要把不满足硬条件的股票混进结果。
+- 总市值请使用“亿元”
+- 龙虎榜净买额请使用“亿元”
+- 涨停次数使用整数
+- 换手率使用百分比
+- 涨跌幅使用百分比
+- 龙虎榜没有数据时可以填0
+- 涨停次数没有数据时可以填0
+
+请优先返回数据完整、近期强势的股票。
 """
 
-
 def num(v, default=0.0):
-    """
-    把数字、百分比、万、亿、亿元等转换成 float。
-    """
-    if isinstance(v, dict):
-        for k in (
-            "value",
-            "val",
-            "text",
-            "raw",
-            "displayValue",
-            "display_value"
-        ):
-            if k in v:
-                return num(v[k], default)
+    if v is None:
         return default
 
-    if isinstance(v, list):
-        if len(v) == 1:
-            return num(v[0], default)
+    s = str(v).strip()
+
+    if not s or s in ("-", "--", "—", "None", "null", "N/A"):
         return default
 
-    if v in (None, "", "-", "--", "—", "暂无", "无"):
-        return default
-
-    s = str(v)
-    s = s.replace(",", "")
-    s = s.replace("，", "")
-    s = s.replace("%", "")
-    s = s.strip()
+    s = s.replace(",", "").replace("％", "%")
 
     try:
-        m = re.search(r"-?\d+(?:\.\d+)?", s)
+        # 处理中文单位
+        if "亿" in s:
+            s = s.replace("亿元", "").replace("亿", "").strip()
+            return float(s)
 
-        if not m:
-            return default
+        if "万" in s:
+            s = s.replace("万元", "").replace("万", "").strip()
+            return float(s) / 10000
 
-        n = float(m.group(0))
+        s = s.replace("%", "").strip()
 
-        if "万亿" in s:
-            n *= 10000
-
-        elif "亿元" in s or "亿" in s:
-            n *= 1
-
-        elif "万元" in s or "万" in s:
-            n /= 10000
-
-        return n
+        return float(s)
 
     except Exception:
+        m = re.search(r"-?\d+(?:\.\d+)?", s)
+
+        if m:
+            try:
+                return float(m.group())
+            except Exception:
+                pass
+
         return default
 
 
 def pick(row, *names):
-    """
-    尽可能兼容妙想返回的各种字段名称。
-    """
-
-    if not isinstance(row, dict):
-        return ""
-
     # 精确匹配
     for name in names:
-        if name in row:
-            value = row[name]
-
-            if value not in (None, ""):
-                return value
+        if name in row and row[name] not in (None, ""):
+            return row[name]
 
     # 模糊匹配
-    for key, value in row.items():
-
-        if value in (None, ""):
+    for k, v in row.items():
+        if v in (None, ""):
             continue
 
-        key_text = str(key).lower()
+        ks = str(k).lower()
 
         for name in names:
-
-            if str(name).lower() in key_text:
-                return value
-
-    # 递归搜索
-    for value in row.values():
-
-        if isinstance(value, dict):
-
-            result = pick(value, *names)
-
-            if result not in ("", None):
-                return result
+            if str(name).lower() in ks:
+                return v
 
     return ""
 
 
 def extract_rows(obj):
-
     if not isinstance(obj, dict):
         return []
 
     outer = obj.get("data") or {}
-
-    if not isinstance(outer, dict):
-        return []
-
     inner = outer.get("data") or {}
 
-    if not isinstance(inner, dict):
-        return []
-
+    # 妙想结构
     all_results = inner.get("allResults") or {}
+    result = all_results.get("result") or {}
 
-    if isinstance(all_results, dict):
+    rows = result.get("dataList") or []
 
-        result = all_results.get("result") or {}
+    if isinstance(rows, list) and rows:
+        return rows
 
-        if isinstance(result, dict):
-
-            rows = result.get("dataList") or []
-
-            if isinstance(rows, list) and rows:
-                return rows
-
-    # 备用：解析 markdown 表格
+    # partialResults Markdown
     partial = inner.get("partialResults") or ""
 
     if not partial:
         return []
 
-    lines = []
-
-    for line in str(partial).splitlines():
-
-        line = line.strip()
-
-        if line.startswith("|"):
-            lines.append(line)
+    lines = [
+        x.strip()
+        for x in str(partial).splitlines()
+        if x.strip().startswith("|")
+    ]
 
     if len(lines) < 3:
         return []
 
     def cells(line):
-
         return [
             x.strip()
             for x in line.strip("|").split("|")
@@ -202,70 +147,26 @@ def extract_rows(obj):
 
     headers = cells(lines[0])
 
-    result = []
+    rows = []
 
     for line in lines[2:]:
-
         values = cells(line)
 
         if len(values) != len(headers):
             continue
 
-        result.append(
-            dict(zip(headers, values))
-        )
+        row = dict(zip(headers, values))
 
-    return result
+        # 跳过分隔线
+        if any("---" in str(v) for v in values):
+            continue
 
+        rows.append(row)
 
-def get_zt_count(row):
-
-    value = pick(
-        row,
-
-        "LIMIT_UP_COUNT_3D",
-        "LIMIT_UP_COUNT",
-        "近3日涨停次数",
-        "近3个交易日涨停次数",
-        "3日涨停次数",
-        "涨停次数",
-        "涨停天数"
-    )
-
-    if value in ("", None):
-        return 0
-
-    # 如果是纯数字
-    try:
-        return int(float(value))
-    except Exception:
-        pass
-
-    text = str(value)
-
-    # 优先寻找“涨停X次”
-    m = re.search(
-        r"涨停\s*(\d+)\s*次",
-        text
-    )
-
-    if m:
-        return int(m.group(1))
-
-    # 再找“X次”
-    m = re.search(
-        r"(\d+)\s*次",
-        text
-    )
-
-    if m:
-        return int(m.group(1))
-
-    return 0
+    return rows
 
 
 def normalize(rows):
-
     result = []
 
     for row in rows:
@@ -273,185 +174,138 @@ def normalize(rows):
         if not isinstance(row, dict):
             continue
 
-        code = str(
-            pick(
-                row,
-                "SECURITY_CODE",
-                "股票代码",
-                "证券代码",
-                "代码"
-            )
-        ).strip()
+        code = str(pick(
+            row,
+            "SECURITY_CODE",
+            "股票代码",
+            "证券代码",
+            "代码"
+        )).strip()
 
-        name = str(
-            pick(
-                row,
-                "SECURITY_SHORT_NAME",
-                "SECURITY_NAME_ABBR",
-                "股票简称",
-                "证券简称",
-                "名称"
-            )
-        ).strip()
+        name = str(pick(
+            row,
+            "SECURITY_SHORT_NAME",
+            "SECURITY_NAME_ABBR",
+            "股票简称",
+            "证券简称",
+            "名称"
+        )).strip()
 
         if not code or not name:
             continue
 
-        upper = name.upper()
+        # 只保留6位A股代码
+        code_clean = re.sub(r"\D", "", code)
 
-        if (
-            "ST" in upper
-            or "退" in name
-        ):
+        if len(code_clean) != 6:
             continue
 
-        price = num(
-            pick(
-                row,
-                "NEWEST_PRICE",
-                "最新价",
-                "现价"
-            )
-        )
+        upper_name = name.upper()
 
-        pct = num(
-            pick(
-                row,
-                "CHG",
-                "涨跌幅",
-                "今日涨跌幅",
-                "涨幅"
-            )
-        )
+        if "ST" in upper_name:
+            continue
 
-        turnover = num(
-            pick(
-                row,
-                "TURNOVER_RATE",
-                "换手率",
-                "今日换手率",
-                "HSL"
-            )
-        )
+        if name.startswith("退"):
+            continue
 
-        # =========================
+        price = num(pick(
+            row,
+            "NEWEST_PRICE",
+            "最新价",
+            "现价",
+            "最新"
+        ))
+
+        pct = num(pick(
+            row,
+            "CHG",
+            "涨跌幅",
+            "今日涨跌幅",
+            "涨幅"
+        ))
+
+        turnover = num(pick(
+            row,
+            "TURNOVER_RATE",
+            "换手率",
+            "今日换手率",
+            "HSL"
+        ))
+
         # 市值
-        # =========================
-
         cap_raw = pick(
             row,
-
             "TOTAL_MARKET_CAP",
-            "TOTAL_MARKET_VALUE",
             "TOTAL_MV",
-
+            "MARKET_CAP",
             "总市值",
             "总市值(元)",
-            "总市值(亿元)",
             "市值"
         )
 
         cap = num(cap_raw)
 
-        # 如果是元
+        # 如果接口返回的是元
         if cap > 100000:
+            cap = cap / 100000000
 
-            cap_yi = cap / 100000000
+        # 如果接口返回的是万元
+        elif cap > 10000:
+            cap = cap / 10000
 
-        else:
-
-            cap_yi = cap
-
-        # =========================
         # 龙虎榜
-        # =========================
-
         lhb_raw = pick(
             row,
-
             "BILLBOARD_NET_AMT",
-            "BILLBOARD_NET_BUY",
+            "LHB_NET_BUY",
             "龙虎榜净买额",
             "龙虎榜净额",
             "龙虎榜净买",
-            "龙虎榜资金净额",
-            "龙虎榜金额",
             "龙虎榜"
         )
 
         lhb = num(lhb_raw)
 
-        # 如果返回的是元
-        if abs(lhb) > 100000:
+        # 如果是元
+        if abs(lhb) > 10000:
+            lhb = lhb / 100000000
 
-            lhb_yi = lhb / 100000000
-
-        else:
-
-            lhb_yi = lhb
-
-        # =========================
-        # 近3日涨停
-        # =========================
-
-        zt_count = get_zt_count(row)
-
-        # =========================
-        # 竞价
-        # =========================
-
-        buy = num(
-            pick(
-                row,
-
-                "BID_AMOUNT",
-                "BID_AMT",
-
-                "竞价委买金额",
-                "委买金额",
-                "委买",
-                "竞价委买",
-                "集合竞价委买"
-            )
+        # 涨停次数
+        zt_raw = pick(
+            row,
+            "LIMIT_UP_COUNT_3D",
+            "LIMIT_UP_COUNT",
+            "近3日涨停次数",
+            "近3个交易日涨停次数",
+            "3日涨停",
+            "涨停次数"
         )
 
-        sell = num(
-            pick(
-                row,
+        zt_count = int(max(0, num(zt_raw)))
 
-                "ASK_AMOUNT",
-                "ASK_AMT",
+        # 委买
+        buy = num(pick(
+            row,
+            "BID_AMOUNT",
+            "委买金额",
+            "竞价委买",
+            "集合竞价委买"
+        ))
 
-                "竞价委卖金额",
-                "委卖金额",
-                "委卖",
-                "竞价委卖",
-                "集合竞价委卖"
-            )
-        )
+        # 委卖
+        sell = num(pick(
+            row,
+            "ASK_AMOUNT",
+            "委卖金额",
+            "竞价委卖",
+            "集合竞价委卖"
+        ))
 
-        # =========================
-        # 硬条件
-        # =========================
-
-        if cap_yi <= 0:
-            continue
-
-        if cap_yi > 300:
-            continue
-
-        if zt_count < 1:
-            continue
-
-        # 龙虎榜必须有明确字段
-        if lhb_raw in ("", None):
-            continue
-
-        # =========================
+        # -------------------------
         # 妖股评分
-        # =========================
+        # -------------------------
 
-        score = 40
+        score = 30
 
         # 涨幅
         if pct >= 5:
@@ -466,65 +320,75 @@ def normalize(rows):
         # 换手
         if turnover > 29.25:
             score += 15
-
+        elif turnover > 20:
+            score += 10
         elif turnover > 15:
-            score += 8
-
+            score += 7
         elif turnover > 8:
             score += 4
 
-        # 龙虎榜资金
-        if lhb_yi > 0:
+        # 龙虎榜
+        if lhb > 0:
             score += 10
 
-        elif lhb_yi < 0:
+        if lhb >= 1:
             score += 3
 
-        # 3日涨停次数
-        if zt_count >= 2:
-            score += 10
+        if lhb < 0:
+            score += 2
 
-        elif zt_count == 1:
+        # 近3日涨停
+        if zt_count >= 3:
+            score += 15
+        elif zt_count >= 2:
+            score += 10
+        elif zt_count >= 1:
             score += 5
 
         # 委卖 > 委买
-        if sell > buy:
-            score += 10
+        if sell > buy and (sell + buy) > 0:
+            score += 5
+
+        # 硬条件判断
+        hard_zt = zt_count >= 1
+        hard_lhb = abs(lhb) > 0
+        hard_cap = cap > 0 and cap <= 300
+
+        hard_count = sum([
+            hard_zt,
+            hard_lhb,
+            hard_cap
+        ])
 
         result.append({
-
-            "code": code,
-
+            "code": code_clean,
             "name": name,
-
             "price": price,
-
             "pct": pct,
-
             "turnover": turnover,
-
-            "market_cap": cap_yi,
-
-            "lhb_net": lhb_yi,
-
+            "market_cap": cap,
+            "lhb_net": lhb,
             "zt_count": zt_count,
-
             "buy": buy,
-
             "sell": sell,
-
-            "score": min(
-                100,
-                int(score)
-            )
+            "score": min(100, int(score)),
+            "hard_count": hard_count,
+            "hard_zt": hard_zt,
+            "hard_lhb": hard_lhb,
+            "hard_cap": hard_cap
         })
 
+    # 优先：
+    # 1. 三项硬条件全部满足
+    # 2. 硬条件满足数量
+    # 3. 妖股评分
+    # 4. 涨幅
     result.sort(
         key=lambda x: (
+            x["hard_count"],
             x["score"],
             x["pct"],
-            x["lhb_net"],
-            x["zt_count"]
+            x["lhb_net"]
         ),
         reverse=True
     )
@@ -537,24 +401,18 @@ def query_miaoxiang():
     api_key = os.getenv("MX_APIKEY")
 
     if not api_key:
-        raise RuntimeError(
-            "MX_APIKEY 未设置"
-        )
+        raise RuntimeError("MX_APIKEY 未设置")
 
     response = requests.post(
-
         MX_URL,
-
         headers={
             "Content-Type": "application/json",
             "apikey": api_key
         },
-
         json={
             "keyword": QUERY
         },
-
-        timeout=35
+        timeout=40
     )
 
     response.raise_for_status()
@@ -570,10 +428,7 @@ def get_data():
         CACHE["data"]
         and now - CACHE["ts"] < CACHE_SECONDS
     ):
-        return (
-            CACHE["data"],
-            CACHE["source"]
-        )
+        return CACHE["data"], CACHE["source"]
 
     try:
 
@@ -584,50 +439,36 @@ def get_data():
         data = normalize(rows)
 
         CACHE["ts"] = now
-
         CACHE["data"] = data
+        CACHE["source"] = "东方财富妙想智能选股 API"
 
-        CACHE["source"] = (
-            "东方财富妙想智能选股 API"
-        )
+        print("ROWS:", len(rows))
+        print("NORMALIZED:", len(data))
 
-        return (
-            data,
-            CACHE["source"]
-        )
+        return data, CACHE["source"]
 
     except Exception as e:
 
         CACHE["ts"] = now
-
         CACHE["data"] = []
-
-        CACHE["source"] = (
-            "接口异常：" + str(e)[:180]
-        )
+        CACHE["source"] = "接口异常：" + str(e)[:180]
 
         print(
             "MIAOXIANG_ERROR:",
             repr(e)
         )
 
-        return (
-            [],
-            CACHE["source"]
-        )
+        return [], CACHE["source"]
 
 
 @app.get("/api/health")
 def health():
 
     return {
-
         "status": "ok",
-
-        "mx_apikey_configured":
-            bool(
-                os.getenv("MX_APIKEY")
-            )
+        "mx_apikey_configured": bool(
+            os.getenv("MX_APIKEY")
+        )
     }
 
 
@@ -636,92 +477,115 @@ def scanner():
 
     data, source = get_data()
 
+    # 真正的硬条件结果
+    hard = [
+        x for x in data
+        if x["hard_zt"]
+        and x["hard_lhb"]
+        and x["hard_cap"]
+    ]
+
     return {
-
         "status": "ok",
-
         "source": source,
-
-        "updated_at":
-            time.strftime(
-                "%Y-%m-%d %H:%M:%S"
-            ),
-
-        "top3":
-            data[:3],
-
-        "data":
-            data
+        "updated_at": time.strftime(
+            "%Y-%m-%d %H:%M:%S"
+        ),
+        "top3": hard[:3] if hard else data[:3],
+        "hard_condition_count": len(hard),
+        "data": data
     }
 
 
-@app.get(
-    "/",
-    response_class=HTMLResponse
-)
+@app.get("/", response_class=HTMLResponse)
 def home():
 
     data, source = get_data()
 
-    top3 = data[:3]
+    hard = [
+        x for x in data
+        if x["hard_zt"]
+        and x["hard_lhb"]
+        and x["hard_cap"]
+    ]
 
-    cards = ""
+    # 有完整硬条件就显示完整硬条件
+    # 没有则显示最强候选，避免整页空白
+    top3 = hard[:3] if hard else data[:3]
 
-    for i, x in enumerate(top3):
+    if top3:
 
-        cards += f"""
-        <div class="card">
+        cards = ""
 
-            <div class="rank">
-                #{i + 1}
+        for i, x in enumerate(top3):
+
+            cards += f"""
+            <div class="card">
+
+                <div class="rank">
+                    #{i + 1}
+                    · 硬条件 {x["hard_count"]}/3
+                </div>
+
+                <div class="name">
+                    {html.escape(x["name"])}
+                </div>
+
+                <div class="code">
+                    {html.escape(x["code"])}
+                </div>
+
+                <div class="bigscore">
+                    {x["score"]}
+                    <small>分</small>
+
+                    <span>
+                        {x["pct"]:+.2f}%
+                    </span>
+                </div>
+
+                <div class="detail">
+
+                    市值：
+                    {x["market_cap"]:.2f}亿
+
+                    <br>
+
+                    龙虎榜：
+                    {x["lhb_net"]:+.2f}亿
+
+                    <br>
+
+                    近3日涨停：
+                    {x["zt_count"]}次
+
+                    <br>
+
+                    换手：
+                    {x["turnover"]:.2f}%
+
+                </div>
+
             </div>
+            """
 
-            <div class="name">
-                {html.escape(x["name"])}
-            </div>
-
-            <div class="code">
-                {html.escape(x["code"])}
-            </div>
-
-            <div class="bigscore">
-
-                {x["score"]}
-                <small>分</small>
-
-                <span>
-                    {x["pct"]:+.2f}%
-                </span>
-
-            </div>
-
-            <div class="detail">
-
-                市值
-                {x["market_cap"]:.2f}亿
-
-                · 龙虎榜
-                {x["lhb_net"]:+.2f}亿
-
-                · 近3日涨停
-                {x["zt_count"]}次
-
-            </div>
-
-        </div>
-        """
-
-    if not cards:
+    else:
 
         cards = """
         <div class="empty">
-            当前没有满足全部硬条件的股票
+            暂无有效候选数据，请稍后刷新
         </div>
         """
 
     rows = ""
 
     for x in data:
+
+        hard_text = (
+            "✓ 满足"
+            if x["hard_count"] == 3
+            else f'{x["hard_count"]}/3'
+        )
 
         rows += f"""
         <tr>
@@ -761,11 +625,7 @@ def home():
             </td>
 
             <td>
-                {x["buy"]:.2f}
-            </td>
-
-            <td>
-                {x["sell"]:.2f}
+                {hard_text}
             </td>
 
             <td class="score">
@@ -779,9 +639,9 @@ def home():
 
         rows = """
         <tr>
-            <td colspan="11"
+            <td colspan="10"
                 class="empty">
-                暂无符合条件的数据
+                暂无候选数据
             </td>
         </tr>
         """
@@ -799,17 +659,13 @@ def home():
 
 <meta charset="utf-8">
 
-<meta
- name="viewport"
- content="width=device-width,
- initial-scale=1,
- maximum-scale=1"
->
+<meta name="viewport"
+content="width=device-width,
+initial-scale=1,
+maximum-scale=1">
 
-<meta
- http-equiv="refresh"
- content="60"
->
+<meta http-equiv="refresh"
+content="60">
 
 <title>🔥 妖股雷达</title>
 
@@ -828,11 +684,11 @@ body {{
     color:#edf2f8;
 
     font-family:
-        -apple-system,
-        BlinkMacSystemFont,
-        "PingFang SC",
-        "Microsoft YaHei",
-        sans-serif;
+    -apple-system,
+    BlinkMacSystemFont,
+    "PingFang SC",
+    "Microsoft YaHei",
+    sans-serif;
 
 }}
 
@@ -858,9 +714,10 @@ h1 {{
 
     color:#8390a3;
 
-    line-height:1.8;
+    line-height:1.7;
 
-    margin:8px 0 12px;
+    margin:
+    7px 0 12px;
 
 }}
 
@@ -889,7 +746,7 @@ h1 {{
     display:grid;
 
     grid-template-columns:
-        repeat(3,1fr);
+    repeat(3,1fr);
 
     gap:10px;
 
@@ -950,6 +807,8 @@ h1 {{
 
     font-size:12px;
 
+    font-weight:400;
+
 }}
 
 .bigscore span {{
@@ -980,9 +839,10 @@ table {{
 
     width:100%;
 
-    min-width:1100px;
+    min-width:1000px;
 
-    border-collapse:collapse;
+    border-collapse:
+    collapse;
 
 }}
 
@@ -992,7 +852,7 @@ td {{
     padding:11px 9px;
 
     border-bottom:
-        1px solid #202d3c;
+    1px solid #202d3c;
 
     text-align:left;
 
@@ -1076,35 +936,20 @@ td {{
 
 <div class="wrap">
 
-<h1>🔥 妖股雷达</h1>
+<h1>
+🔥 妖股雷达
+</h1>
 
 <div class="sub">
 
 硬条件：
-
-近3交易日涨停
-
-+
-
-龙虎榜
-
-+
-
-总市值 ≤ 300亿
+近3交易日涨停 + 龙虎榜 + 总市值 ≤ 300亿
 
 <br>
 
-加权评分：
-
+评分：
 涨幅 + 换手率 + 龙虎榜资金
-
-+
-
-近3日涨停次数
-
-+
-
-竞价委买/委卖
++ 近3日涨停次数 + 竞价强弱
 
 </div>
 
@@ -1129,15 +974,23 @@ td {{
 <tr>
 
 <th>代码</th>
+
 <th>名称</th>
+
 <th>现价</th>
+
 <th>涨幅</th>
+
 <th>换手</th>
+
 <th>市值</th>
-<th>龙虎榜净买额</th>
+
+<th>龙虎榜净额</th>
+
 <th>近3日涨停</th>
-<th>竞价委买</th>
-<th>竞价委卖</th>
+
+<th>硬条件</th>
+
 <th>妖股评分</th>
 
 </tr>
@@ -1170,8 +1023,7 @@ td {{
 
 <br>
 
-⚠️ 妖股评分仅用于量化筛选和研究，
-不构成投资建议。
+⚠️ 妖股评分仅用于量化筛选和研究，不构成投资建议。
 
 </div>
 
