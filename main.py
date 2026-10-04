@@ -8,27 +8,97 @@ from fastapi import FastAPI
 from fastapi.responses import HTMLResponse
 
 
+# =========================================================
+# 妖股雷达
+# 东方财富妙想智能选股
+# =========================================================
+
 app = FastAPI(title="妖股雷达")
 
-MX_URL = "https://mkapi2.dfcfs.com/finskillshub/api/claw/stock-screen"
+MX_URL = (
+    "https://mkapi2.dfcfs.com/"
+    "finskillshub/api/claw/stock-screen"
+)
 
 
 # =========================================================
-# 妙想智能选股
+# 通用 JSON 解包
 # =========================================================
 
-def mx_search(keyword: str) -> Dict[str, Any]:
+def unwrap_json(value, max_depth=8):
+    """
+    妙想接口某些情况下会出现：
+        dict
+        ↓
+        data = '{"data": {...}}'
+        ↓
+        再一层 JSON 字符串
+
+    所以这里统一自动解包。
+    """
+
+    current = value
+
+    for _ in range(max_depth):
+
+        if isinstance(current, (dict, list)):
+            return current
+
+        if isinstance(current, str):
+
+            text = current.strip()
+
+            if not text:
+                return {}
+
+            try:
+                current = json.loads(text)
+                continue
+            except Exception:
+                return current
+
+        return current
+
+    return current
+
+
+def as_dict(value):
+    value = unwrap_json(value)
+
+    if isinstance(value, dict):
+        return value
+
+    return {}
+
+
+def as_list(value):
+    value = unwrap_json(value)
+
+    if isinstance(value, list):
+        return value
+
+    return []
+
+
+# =========================================================
+# 妙想 API
+# =========================================================
+
+def mx_search(keyword: str):
+
     api_key = os.getenv("MX_APIKEY")
 
     if not api_key:
         raise RuntimeError(
-            "Render 环境变量 MX_APIKEY 未设置"
+            "没有找到 MX_APIKEY。\n"
+            "请到 Render → Environment 确认已经设置 MX_APIKEY。"
         )
 
     headers = {
         "Content-Type": "application/json",
         "apikey": api_key,
         "User-Agent": "YaoguRadar/1.0",
+        "Accept": "application/json,text/plain,*/*",
     }
 
     payload = {
@@ -37,60 +107,155 @@ def mx_search(keyword: str) -> Dict[str, Any]:
 
     last_error = None
 
-    for i in range(3):
+    for attempt in range(3):
 
         try:
 
-            r = requests.post(
+            response = requests.post(
                 MX_URL,
                 headers=headers,
                 json=payload,
-                timeout=40,
+                timeout=60,
             )
 
-            r.raise_for_status()
+            response.raise_for_status()
 
-            data = r.json()
+            # 第一次解析
+            raw = response.json()
 
-            if data.get("status") != 0:
+            # 防止接口返回字符串 JSON
+            result = unwrap_json(raw)
+
+            if not isinstance(result, dict):
+
                 raise RuntimeError(
-                    f"妙想接口错误："
-                    f"{data.get('message', '')}"
+                    "妙想接口返回格式异常："
+                    + str(type(result).__name__)
                 )
 
-            return data
+            # -------------------------------------------------
+            # 官方顶层 status
+            # 0 = 成功
+            # -------------------------------------------------
+
+            status = result.get("status")
+
+            if status is not None:
+
+                try:
+                    status_num = int(status)
+                except Exception:
+                    status_num = status
+
+                if status_num != 0:
+
+                    message = (
+                        result.get("message")
+                        or result.get("msg")
+                        or result.get("error")
+                        or "未知接口错误"
+                    )
+
+                    raise RuntimeError(
+                        f"妙想接口错误：{message}"
+                    )
+
+            return result
 
         except Exception as e:
 
             last_error = e
 
-            if i < 2:
+            if attempt < 2:
                 time.sleep(2)
 
     raise RuntimeError(
-        f"妙想接口连接失败：{last_error}"
+        f"妙想接口调用失败：{last_error}"
     )
 
 
 # =========================================================
-# 提取妙想结果
+# 官方结果解析
 # =========================================================
 
-def extract_rows(result: Dict[str, Any]):
+def extract_data(result):
 
-    root = result.get("data") or {}
-    inner = root.get("data") or {}
+    result = as_dict(result)
 
-    # 官方文档推荐全量 dataList
-    all_results = inner.get("allResults") or {}
-    result_obj = all_results.get("result") or {}
+    # -------------------------------------------------------
+    # 官方结构：
+    #
+    # data
+    #   └── data
+    #        ├── allResults
+    #        │    └── result
+    #        │         ├── columns
+    #        │         └── dataList
+    #        │
+    #        ├── partialResults
+    #        ├── responseConditionList
+    #        ├── totalCondition
+    #        └── parserText
+    # -------------------------------------------------------
 
-    rows = result_obj.get("dataList") or []
-    columns = result_obj.get("columns") or []
+    data = as_dict(
+        result.get("data")
+    )
 
-    if rows:
+    inner = as_dict(
+        data.get("data")
+    )
+
+    # =======================================================
+    # 读取条件说明
+    # =======================================================
+
+    condition_list = as_list(
+        inner.get(
+            "responseConditionList"
+        )
+    )
+
+    total_condition = as_dict(
+        inner.get(
+            "totalCondition"
+        )
+    )
+
+    parser_text = inner.get(
+        "parserText",
+        ""
+    )
+
+    # =======================================================
+    # ① 优先 dataList
+    # =======================================================
+
+    all_results = as_dict(
+        inner.get("allResults")
+    )
+
+    result_obj = as_dict(
+        all_results.get("result")
+    )
+
+    data_list = as_list(
+        result_obj.get("dataList")
+    )
+
+    columns = as_list(
+        result_obj.get("columns")
+    )
+
+    if data_list:
+
+        # ---------------------------------------------------
+        # columns 官方字段：
+        # key / title / displayName / dateMsg
+        # ---------------------------------------------------
 
         column_map = {}
+        column_order = []
 
         for col in columns:
 
@@ -98,149 +263,308 @@ def extract_rows(result: Dict[str, Any]):
                 continue
 
             key = (
-                col.get("field")
+                col.get("key")
+                or col.get("field")
                 or col.get("name")
-                or col.get("key")
             )
 
             title = (
-                col.get("displayName")
-                or col.get("title")
+                col.get("title")
+                or col.get("displayName")
                 or col.get("label")
                 or key
             )
 
+            date_msg = col.get(
+                "dateMsg",
+                ""
+            )
+
+            if date_msg:
+                title = (
+                    str(title)
+                    + " "
+                    + str(date_msg)
+                )
+
             if key:
-                column_map[str(key)] = str(title)
 
-        output = []
+                key = str(key)
+                title = str(title)
 
-        for row in rows:
+                column_map[key] = title
+                column_order.append(key)
 
-            if not isinstance(row, dict):
+        rows = []
+
+        for raw_row in data_list:
+
+            raw_row = as_dict(
+                raw_row
+            )
+
+            if not raw_row:
                 continue
 
-            x = {}
+            row = {}
 
-            for key, value in row.items():
+            # 按 columns 顺序
+            for key in column_order:
+
+                if key not in raw_row:
+                    continue
+
+                value = raw_row.get(key)
 
                 title = column_map.get(
-                    str(key),
-                    str(key)
+                    key,
+                    key
                 )
 
-                x[title] = value
-
-                # 同时保留原始字段
-                x[f"__{key}"] = value
-
-            output.append(x)
-
-        return output
-
-    # =====================================================
-    # fallback：partialResults
-    # =====================================================
-
-    partial = inner.get("partialResults") or ""
-
-    if isinstance(partial, str) and partial.strip():
-
-        lines = [
-            x.strip()
-            for x in partial.splitlines()
-            if x.strip()
-        ]
-
-        if len(lines) >= 2:
-
-            def split_line(line):
-                return [
-                    x.strip()
-                    for x in line.strip("|").split("|")
-                ]
-
-            headers = split_line(lines[0])
-
-            start = 1
-
-            if start < len(lines):
-                if set(
-                    lines[start].replace("|", "")
-                ) <= {"-", " ", ":"}:
-                    start += 1
-
-            output = []
-
-            for line in lines[start:]:
-
-                cells = split_line(line)
-
-                if len(cells) < len(headers):
-                    cells += [""] * (
-                        len(headers) - len(cells)
-                    )
-
-                row = dict(
-                    zip(headers, cells)
+                row[title] = (
+                    format_value(value)
                 )
 
-                output.append(row)
+                # 保留英文原字段
+                row[f"__{key}"] = value
 
-            return output
+            # columns 没有定义的字段也保留
+            for key, value in raw_row.items():
 
-    return []
+                if key in column_order:
+                    continue
+
+                row[key] = format_value(
+                    value
+                )
+
+                row[f"__{key}"] = value
+
+            rows.append(row)
+
+        return {
+            "rows": rows,
+            "source": "dataList",
+            "condition_list": condition_list,
+            "total_condition": total_condition,
+            "parser_text": parser_text,
+            "total": len(rows),
+        }
+
+    # =======================================================
+    # ② fallback：partialResults
+    # =======================================================
+
+    partial = inner.get(
+        "partialResults",
+        ""
+    )
+
+    partial = unwrap_json(
+        partial
+    )
+
+    if isinstance(partial, str):
+
+        rows = parse_markdown_table(
+            partial
+        )
+
+        return {
+            "rows": rows,
+            "source": "partialResults",
+            "condition_list": condition_list,
+            "total_condition": total_condition,
+            "parser_text": parser_text,
+            "total": len(rows),
+        }
+
+    # =======================================================
+    # ③ 没有结果
+    # =======================================================
+
+    return {
+        "rows": [],
+        "source": "",
+        "condition_list": condition_list,
+        "total_condition": total_condition,
+        "parser_text": parser_text,
+        "total": 0,
+    }
 
 
 # =========================================================
-# 字段识别
+# 数据格式化
+# =========================================================
+
+def format_value(value):
+
+    if value is None:
+        return ""
+
+    if isinstance(
+        value,
+        (dict, list)
+    ):
+        return json.dumps(
+            value,
+            ensure_ascii=False
+        )
+
+    return str(value)
+
+
+# =========================================================
+# Markdown 表格解析
+# =========================================================
+
+def parse_markdown_table(text):
+
+    if not text:
+        return []
+
+    lines = [
+        x.strip()
+        for x in str(text).splitlines()
+        if x.strip()
+    ]
+
+    if len(lines) < 2:
+        return []
+
+    def split_line(line):
+
+        return [
+            x.strip()
+            for x in line.strip("|").split("|")
+        ]
+
+    headers = split_line(
+        lines[0]
+    )
+
+    if not headers:
+        return []
+
+    start = 1
+
+    # 跳过 |---|---|
+    if start < len(lines):
+
+        check = (
+            lines[start]
+            .replace("|", "")
+            .replace("-", "")
+            .replace(":", "")
+            .strip()
+        )
+
+        if not check:
+            start += 1
+
+    rows = []
+
+    for line in lines[start:]:
+
+        cells = split_line(
+            line
+        )
+
+        if len(cells) < len(headers):
+
+            cells += [
+                ""
+            ] * (
+                len(headers)
+                - len(cells)
+            )
+
+        if len(cells) > len(headers):
+
+            cells = cells[
+                :len(headers)
+            ]
+
+        rows.append(
+            dict(
+                zip(
+                    headers,
+                    cells
+                )
+            )
+        )
+
+    return rows
+
+
+# =========================================================
+# 字段读取
 # =========================================================
 
 def get_value(row, keys):
 
+    if not isinstance(row, dict):
+        return ""
+
+    # 直接字段
     for key in keys:
 
         if key in row:
             return row[key]
 
-        key2 = f"__{key}"
+    # 原始英文字段
+    for key in keys:
 
-        if key2 in row:
-            return row[key2]
+        raw_key = f"__{key}"
+
+        if raw_key in row:
+            return row[raw_key]
 
     # 模糊匹配
-    for k, v in row.items():
+    for actual_key, value in row.items():
 
-        if not isinstance(k, str):
+        if not isinstance(
+            actual_key,
+            str
+        ):
             continue
 
         for key in keys:
 
-            if key.lower() in k.lower():
-                return v
+            if (
+                key.lower()
+                in actual_key.lower()
+            ):
+                return value
 
     return ""
 
 
-def to_float(v, default=0):
+def number(value):
 
     try:
 
-        if v is None or v == "":
-            return default
+        if value is None:
+            return 0.0
 
-        s = str(v)
-        s = (
-            s.replace("%", "")
-             .replace(",", "")
-             .replace("亿", "")
-             .strip()
+        text = str(value).strip()
+
+        if not text:
+            return 0.0
+
+        text = (
+            text
+            .replace(",", "")
+            .replace("%", "")
+            .replace("元", "")
+            .replace("亿", "")
+            .replace("万", "")
         )
 
-        return float(s)
+        return float(text)
 
     except Exception:
-        return default
+        return 0.0
 
 
 # =========================================================
@@ -254,6 +578,7 @@ def normalize_stock(row):
         [
             "SECURITY_CODE",
             "股票代码",
+            "证券代码",
             "代码",
         ]
     )
@@ -273,6 +598,7 @@ def normalize_stock(row):
         [
             "NEWEST_PRICE",
             "最新价",
+            "最新价 (元)",
             "最新价格",
         ]
     )
@@ -282,16 +608,7 @@ def normalize_stock(row):
         [
             "CHG",
             "涨跌幅",
-        ]
-    )
-
-    market = get_value(
-        row,
-        [
-            "TOTAL_MARKET_CAP",
-            "TOTAL_MARKET_VALUE",
-            "总市值",
-            "总市值(元)",
+            "涨跌幅 (%)",
         ]
     )
 
@@ -300,22 +617,93 @@ def normalize_stock(row):
         [
             "TURNOVER_RATE",
             "换手率",
+            "换手率 (%)",
+        ]
+    )
+
+    market = get_value(
+        row,
+        [
+            "TOTAL_MARKET_CAP",
+            "TOTAL_MARKET_VALUE",
+            "TOTAL_MARKET_VALUE",
+            "总市值",
+            "总市值(元)",
+            "总市值 (元)",
         ]
     )
 
     return {
         "code": str(code or ""),
         "name": str(name or ""),
-        "price": to_float(price),
-        "chg": to_float(chg),
-        "market": to_float(market),
-        "turnover": to_float(turnover),
+        "price": number(price),
+        "chg": number(chg),
+        "turnover": number(turnover),
+        "market": number(market),
         "raw": row,
     }
 
 
 # =========================================================
-# 分析
+# 综合评分
+# =========================================================
+
+def calculate_score(stock):
+
+    score = 80
+
+    chg = stock["chg"]
+    turnover = stock["turnover"]
+
+    # 涨幅
+    if chg >= 9:
+        score += 10
+    elif chg >= 5:
+        score += 7
+    elif chg >= 3:
+        score += 4
+
+    # 换手
+    if turnover >= 20:
+        score += 10
+    elif turnover >= 10:
+        score += 7
+    elif turnover >= 5:
+        score += 4
+
+    return min(
+        100,
+        int(score)
+    )
+
+
+# =========================================================
+# 操作提示
+# =========================================================
+
+def add_signals(stock):
+
+    stock["buy"] = (
+        "反转阴低点附近，"
+        "等待援军确认后考虑"
+    )
+
+    stock["hold"] = (
+        "高点高、低点高、"
+        "收盘高：继续持有"
+    )
+
+    stock["sell"] = (
+        "高点不创新高、"
+        "收盘不高于前日、"
+        "低点跌破前日低点时警戒"
+    )
+
+    return stock
+
+
+# =========================================================
+# 分析结果
 # =========================================================
 
 def analyze_rows(rows):
@@ -324,68 +712,39 @@ def analyze_rows(rows):
 
     for row in rows:
 
-        x = normalize_stock(row)
-
-        if not x["code"]:
-            continue
-
-        # 排除明显风险股
-        if "ST" in x["name"].upper():
-            continue
-
-        if "退" in x["name"]:
-            continue
-
-        # 计算综合评分
-        score = 0
-
-        # 五大条件由妙想筛选器负责
-        score += 50
-
-        if x["chg"] >= 5:
-            score += 15
-
-        elif x["chg"] >= 3:
-            score += 10
-
-        elif x["chg"] > 0:
-            score += 5
-
-        if x["turnover"] >= 20:
-            score += 15
-
-        elif x["turnover"] >= 10:
-            score += 10
-
-        elif x["turnover"] >= 5:
-            score += 5
-
-        if x["market"] > 0:
-
-            # 300亿以内
-            if x["market"] <= 300 * 100000000:
-                score += 10
-
-        score = min(score, 100)
-
-        x["score"] = score
-
-        # 操作提示
-        x["buy"] = (
-            "优先等回踩确认，"
-            "反转阴低点附近配合援军"
+        stock = normalize_stock(
+            row
         )
 
-        x["hold"] = (
-            "高点高、低点高、收盘高：继续持有"
+        if not stock["code"]:
+            continue
+
+        name_upper = (
+            stock["name"]
+            .upper()
         )
 
-        x["sell"] = (
-            "高点不创新高、收盘不高于前日、"
-            "低点跌破前日低点时警戒卖出"
+        # 排除 ST
+        if "ST" in name_upper:
+            continue
+
+        # 排除退市
+        if "退" in stock["name"]:
+            continue
+
+        stock["score"] = (
+            calculate_score(
+                stock
+            )
         )
 
-        stocks.append(x)
+        stock = add_signals(
+            stock
+        )
+
+        stocks.append(
+            stock
+        )
 
     stocks.sort(
         key=lambda x: (
@@ -400,34 +759,44 @@ def analyze_rows(rows):
 
 
 # =========================================================
-# 五条件查询
+# 选股语句
 # =========================================================
 
-def build_keyword(date: Optional[str] = None):
+def build_query(date):
 
-    date_text = date or "最新交易日"
+    date_text = (
+        date
+        if date
+        else "最新交易日"
+    )
 
     return f"""
-A股，{date_text}附近进行选股。
+请在A股中严格执行以下5个核心硬条件进行选股，
+参考日期为 {date_text}：
 
-严格按照以下5个硬条件筛选：
+① 连续5个交易日上涨；
+② 最近30个交易日内至少出现过一次涨停；
+③ 最新收盘价不破5日均线；
+④ 成交量出现明显堆量；
+⑤ 底部筹码保持稳定，没有明显底部破坏。
 
-1、连续5个交易日上涨；
-2、最近30个交易日内有过涨停；
-3、最新收盘价不破5日均线；
-4、成交量出现明显堆量；
-5、底部筹码保持稳定，不出现明显底部破坏。
+同时要求：
 
-另外要求：
-市值300亿元以内；
-排除ST和退市股票。
+- A股；
+- 总市值300亿元以内；
+- 排除ST；
+- 排除退市股票；
+- 按综合强势程度从高到低排序。
 
-请返回符合条件的股票，并按照强势程度排序。
+这5条是唯一硬条件。
 
-返回股票代码、股票简称、最新价、涨跌幅、
-换手率、总市值等可获得行情字段。
+不要把买点、持有、卖出规则当成硬条件。
 
-不要把买点、持股、卖出规则作为筛选硬条件。
+请尽可能返回：
+股票代码、股票简称、最新价、涨跌幅、
+换手率、总市值。
+
+请只返回符合以上5条条件的股票。
 """.strip()
 
 
@@ -435,44 +804,65 @@ A股，{date_text}附近进行选股。
 # 扫描
 # =========================================================
 
-def scan(date: Optional[str] = None):
+def run_scan(date=None):
 
-    keyword = build_keyword(date)
+    query = build_query(
+        date
+    )
 
-    result = mx_search(keyword)
+    result = mx_search(
+        query
+    )
 
-    rows = extract_rows(result)
+    parsed = extract_data(
+        result
+    )
 
-    stocks = analyze_rows(rows)
+    rows = parsed["rows"]
+
+    stocks = analyze_rows(
+        rows
+    )
 
     top3 = stocks[:3]
 
-    inner = (
-        result.get("data", {})
-        .get("data", {})
-    )
-
     return {
-        "date": date or "最新交易日",
-        "keyword": keyword,
+        "ok": True,
+
+        "date": (
+            date
+            or "最新交易日"
+        ),
+
         "count": len(stocks),
+
         "top3": top3,
+
         "ranking": stocks[:100],
-        "parser_text": inner.get(
-            "parserText",
-            ""
+
+        "source": parsed[
+            "source"
+        ],
+
+        "condition_list": (
+            parsed[
+                "condition_list"
+            ]
         ),
-        "condition_list": inner.get(
-            "responseConditionList",
-            []
+
+        "total_condition": (
+            parsed[
+                "total_condition"
+            ]
         ),
-        "message": inner.get(
-            "totalCondition",
-            {}
-        ).get(
-            "describe",
-            ""
+
+        "parser_text": (
+            parsed[
+                "parser_text"
+            ]
         ),
+
+        "query": query,
     }
 
 
@@ -490,9 +880,9 @@ HTML = r"""
 <meta charset="UTF-8">
 
 <meta name="viewport"
-      content="width=device-width,
-               initial-scale=1,
-               maximum-scale=1">
+content="width=device-width,
+initial-scale=1,
+maximum-scale=1">
 
 <title>🔥 妖股雷达</title>
 
@@ -504,14 +894,14 @@ HTML = r"""
 
 body{
     margin:0;
-    background:#070707;
+    background:#050505;
     color:#eee;
     font-family:
-      -apple-system,
-      BlinkMacSystemFont,
-      "PingFang SC",
-      "Microsoft YaHei",
-      Arial;
+    -apple-system,
+    BlinkMacSystemFont,
+    "PingFang SC",
+    "Microsoft YaHei",
+    Arial;
 }
 
 .container{
@@ -528,14 +918,14 @@ body{
     margin-bottom:14px;
 }
 
-.title{
-    font-size:27px;
+.logo{
+    font-size:28px;
     font-weight:900;
 }
 
 .sub{
-    margin-top:6px;
     color:#888;
+    margin-top:5px;
     font-size:13px;
 }
 
@@ -548,67 +938,81 @@ body{
 input{
     flex:1;
     min-width:0;
-    background:#1b1b1b;
+    background:#191919;
     color:#fff;
     border:1px solid #333;
     border-radius:10px;
-    padding:12px;
+    padding:13px;
+    font-size:15px;
 }
 
 button{
-    background:#e51b2b;
-    color:#fff;
+    background:#ed1b2f;
+    color:white;
     border:0;
     border-radius:10px;
-    padding:12px 18px;
+    padding:13px 22px;
     font-weight:800;
+    font-size:15px;
+}
+
+button:disabled{
+    opacity:.5;
 }
 
 .card{
-    background:#111;
+    background:#101010;
     border:1px solid #292929;
-    border-radius:16px;
-    padding:15px;
-    margin-bottom:12px;
+    border-radius:17px;
+    padding:16px;
+    margin-bottom:13px;
 }
 
-.title2{
-    font-size:18px;
+.title{
+    font-size:19px;
     font-weight:900;
-    margin-bottom:12px;
+    margin-bottom:13px;
 }
 
 .conditions{
     display:grid;
     grid-template-columns:
-      repeat(5,1fr);
+    repeat(5,1fr);
     gap:8px;
 }
 
 .condition{
-    background:#181818;
+    background:#171717;
     border-radius:10px;
-    padding:11px 7px;
+    padding:12px 6px;
     text-align:center;
     font-size:13px;
+}
+
+.note{
+    color:#999;
+    font-size:12px;
+    line-height:1.7;
+    margin-top:13px;
 }
 
 .top3{
     display:grid;
     grid-template-columns:
-      repeat(3,1fr);
+    repeat(3,1fr);
     gap:10px;
 }
 
 .stock{
     background:#171717;
-    border:1px solid #3a3a3a;
+    border:1px solid #393939;
     border-radius:14px;
     padding:14px;
 }
 
-.stock strong{
+.stock-name{
     font-size:20px;
+    font-weight:900;
 }
 
 .code{
@@ -619,31 +1023,31 @@ button{
 
 .score{
     color:#ff4050;
-    font-size:28px;
+    font-size:29px;
     font-weight:900;
-    margin:8px 0;
+    margin:7px 0;
 }
 
 .info{
     color:#aaa;
-    line-height:1.8;
+    line-height:1.85;
     font-size:13px;
 }
 
 .signal{
-    background:#0c0c0c;
-    padding:10px;
     margin-top:10px;
-    border-radius:10px;
-    line-height:1.8;
+    padding:10px;
+    border-radius:9px;
+    background:#0c0c0c;
     font-size:13px;
+    line-height:1.8;
 }
 
-.good{
-    color:#ff4050;
+.buy{
+    color:#ff4758;
 }
 
-.warn{
+.sell{
     color:#ffb020;
 }
 
@@ -653,14 +1057,13 @@ button{
 
 table{
     width:100%;
+    min-width:680px;
     border-collapse:collapse;
-    min-width:650px;
 }
 
 th,td{
-    padding:10px;
-    border-bottom:
-      1px solid #292929;
+    padding:10px 7px;
+    border-bottom:1px solid #292929;
     text-align:left;
     font-size:13px;
 }
@@ -676,6 +1079,7 @@ th{
 .error{
     color:#ff5263;
     white-space:pre-wrap;
+    line-height:1.7;
 }
 
 .empty{
@@ -686,7 +1090,7 @@ th{
 
     .conditions{
         grid-template-columns:
-          repeat(2,1fr);
+        repeat(2,1fr);
     }
 
     .top3{
@@ -697,19 +1101,25 @@ th{
         flex-direction:column;
     }
 
+    button{
+        width:100%;
+    }
+
 }
 
 </style>
 
 </head>
 
+
 <body>
 
 <div class="container">
 
+
 <div class="header">
 
-<div class="title">
+<div class="logo">
 🔥 妖股雷达
 </div>
 
@@ -720,12 +1130,12 @@ th{
 <div class="toolbar">
 
 <input
- id="date"
- type="date">
+id="date"
+type="date">
 
 <button
- id="scan"
- onclick="doScan()">
+id="scan"
+onclick="scan()">
 开始扫描
 </button>
 
@@ -736,7 +1146,7 @@ th{
 
 <div class="card">
 
-<div class="title2">
+<div class="title">
 五大硬条件
 </div>
 
@@ -764,6 +1174,12 @@ th{
 
 </div>
 
+<div class="note">
+以上5条才属于硬条件。
+⑤“底部筹码不动”由公开数据进行代理判断，
+不能等同于券商真实筹码分布。
+</div>
+
 </div>
 
 
@@ -775,47 +1191,57 @@ th{
 
 </div>
 
+
 </div>
 
 
 <script>
 
-const d =
- new Date();
+const now =
+new Date();
 
-document.getElementById("date").value =
- d.toISOString().slice(0,10);
+document.getElementById(
+"date"
+).value =
+now.toISOString().slice(
+0,10
+);
 
 
 function money(v){
 
-    const n = Number(v || 0);
+    const n =
+    Number(v || 0);
 
     if(n >= 100000000){
+
         return (
-          n / 100000000
-        ).toFixed(2) + "亿";
+            n / 100000000
+        ).toFixed(2)
+        + "亿";
     }
 
     if(n >= 10000){
+
         return (
-          n / 10000
-        ).toFixed(2) + "万";
+            n / 10000
+        ).toFixed(2)
+        + "万";
     }
 
     return n.toFixed(0);
 }
 
 
-function card(x){
+function stockCard(x){
 
     return `
 
     <div class="stock">
 
-        <strong>
+        <div class="stock-name">
             ${x.name || "-"}
-        </strong>
+        </div>
 
         <div class="code">
             ${x.code || "-"}
@@ -828,17 +1254,23 @@ function card(x){
         <div class="info">
 
             最新价：
-            ${Number(x.price || 0).toFixed(2)}
+            ${Number(
+                x.price || 0
+            ).toFixed(2)}
 
             <br>
 
             涨跌幅：
-            ${Number(x.chg || 0).toFixed(2)}%
+            ${Number(
+                x.chg || 0
+            ).toFixed(2)}%
 
             <br>
 
             换手率：
-            ${Number(x.turnover || 0).toFixed(2)}%
+            ${Number(
+                x.turnover || 0
+            ).toFixed(2)}%
 
             <br>
 
@@ -850,21 +1282,21 @@ function card(x){
         <div class="signal">
 
             <div>
-                <span class="good">
+                <span class="buy">
                 买点：
                 </span>
                 ${x.buy}
             </div>
 
             <div>
-                <span class="good">
+                <span class="buy">
                 持有：
                 </span>
                 ${x.hold}
             </div>
 
             <div>
-                <span class="warn">
+                <span class="sell">
                 卖出：
                 </span>
                 ${x.sell}
@@ -878,212 +1310,350 @@ function card(x){
 }
 
 
-async function doScan(){
+function conditionsHtml(list){
+
+    if(!list ||
+       !list.length){
+
+        return "";
+    }
+
+    return `
+
+    <div class="card">
+
+        <div class="title">
+            妙想条件解析
+        </div>
+
+        ${
+            list.map(
+                x => {
+
+                    if(typeof x ===
+                       "string"){
+
+                        return `
+                        <div class="note">
+                        ${x}
+                        </div>
+                        `;
+                    }
+
+                    return `
+                    <div class="note">
+                    ${
+                        x.describe
+                        || x.title
+                        || ""
+                    }
+
+                    ${
+                        x.stockCount !==
+                        undefined
+                        ?
+                        " · 匹配 "
+                        + x.stockCount
+                        + " 只"
+                        :
+                        ""
+                    }
+
+                    </div>
+                    `;
+
+                }
+            ).join("")
+        }
+
+    </div>
+
+    `;
+}
+
+
+async function scan(){
 
     const date =
-      document.getElementById(
+    document.getElementById(
         "date"
-      ).value;
+    ).value;
 
     const button =
-      document.getElementById(
+    document.getElementById(
         "scan"
-      );
+    );
 
     const result =
-      document.getElementById(
+    document.getElementById(
         "result"
-      );
+    );
 
-    button.disabled = true;
-    button.innerText = "扫描中...";
+    button.disabled =
+    true;
+
+    button.innerText =
+    "扫描中...";
 
     result.innerHTML = `
-      <div class="card loading">
-        正在调用东方财富妙想官方选股...
-      </div>
+
+    <div class="card loading">
+
+        正在调用东方财富妙想官方选股接口……
+
+    </div>
+
     `;
 
     try{
 
-        const r =
-          await fetch(
+        const response =
+        await fetch(
             "/api/scanner?date="
             +
-            encodeURIComponent(date)
-          );
+            encodeURIComponent(
+                date
+            ),
+            {
+                cache:"no-store"
+            }
+        );
 
         const data =
-          await r.json();
+        await response.json();
 
-        if(data.error){
+        if(!data.ok){
 
             result.innerHTML = `
-              <div class="card error">
-                ${data.error}
-              </div>
+
+            <div class="card error">
+
+                ${data.error || "扫描失败"}
+
+            </div>
+
             `;
 
             return;
         }
 
+
         let html = "";
 
+
         html += `
+
         <div class="card">
 
-            <div class="title2">
-                TOP3 强势标的
+            <div class="title">
+                🔥 TOP 3 强势票
+            </div>
+
+            <div class="note">
+                ${data.count}
+                只股票符合妙想官方5大硬条件
             </div>
 
             <div class="top3">
 
-              ${
-                data.top3.length
-                ?
-                data.top3
-                  .map(card)
-                  .join("")
-                :
-                `
-                <div class="empty">
-                今天没有返回符合5大硬条件的股票
-                </div>
-                `
-              }
+                ${
+                    data.top3 &&
+                    data.top3.length
+
+                    ?
+
+                    data.top3
+                    .map(stockCard)
+                    .join("")
+
+                    :
+
+                    `
+                    <div class="empty">
+                    今天暂无符合5大硬条件的股票
+                    </div>
+                    `
+                }
 
             </div>
 
         </div>
+
         `;
 
 
         html += `
+
         <div class="card">
 
-          <div class="title2">
-            综合评分排行
-          </div>
+            <div class="title">
+                📊 综合评分排行
+            </div>
 
-          <div class="table-wrap">
+            <div class="table-wrap">
 
-          <table>
+            <table>
 
-          <thead>
+            <thead>
 
-          <tr>
-            <th>排名</th>
-            <th>股票</th>
-            <th>评分</th>
-            <th>最新价</th>
-            <th>涨幅</th>
-            <th>换手率</th>
-            <th>市值</th>
-          </tr>
+            <tr>
 
-          </thead>
+                <th>排名</th>
+                <th>股票</th>
+                <th>条件</th>
+                <th>评分</th>
+                <th>最新价</th>
+                <th>涨幅</th>
+                <th>换手</th>
+                <th>市值</th>
 
-          <tbody>
+            </tr>
 
-          ${
-            data.ranking
-              .map((x,i)=>`
+            </thead>
 
-              <tr>
-
-                <td>${i+1}</td>
-
-                <td>
-                  ${x.name}
-                  <br>
-                  ${x.code}
-                </td>
-
-                <td>
-                  ${x.score}
-                </td>
-
-                <td>
-                  ${Number(
-                    x.price || 0
-                  ).toFixed(2)}
-                </td>
-
-                <td>
-                  ${Number(
-                    x.chg || 0
-                  ).toFixed(2)}%
-                </td>
-
-                <td>
-                  ${Number(
-                    x.turnover || 0
-                  ).toFixed(2)}%
-                </td>
-
-                <td>
-                  ${money(x.market)}
-                </td>
-
-              </tr>
-
-              `)
-              .join("")
-          }
-
-          </tbody>
-
-          </table>
-
-          </div>
-
-        </div>
-        `;
-
-
-        html += `
-        <div class="card">
-
-          <div class="info">
-
-            返回股票：
-            ${data.count}
-
-            <br><br>
-
-            妙想解析条件：
+            <tbody>
 
             ${
-              data.message
-              || "已按5大硬条件提交"
+                (data.ranking || [])
+                .map(
+                    (x,i) => `
+
+                    <tr>
+
+                        <td>
+                            ${i+1}
+                        </td>
+
+                        <td>
+                            ${x.name}
+                            <br>
+                            ${x.code}
+                        </td>
+
+                        <td>
+                            5/5
+                        </td>
+
+                        <td>
+                            ${x.score}
+                        </td>
+
+                        <td>
+                            ${Number(
+                                x.price || 0
+                            ).toFixed(2)}
+                        </td>
+
+                        <td>
+                            ${Number(
+                                x.chg || 0
+                            ).toFixed(2)}%
+                        </td>
+
+                        <td>
+                            ${Number(
+                                x.turnover || 0
+                            ).toFixed(2)}%
+                        </td>
+
+                        <td>
+                            ${money(
+                                x.market
+                            )}
+                        </td>
+
+                    </tr>
+
+                    `
+                )
+                .join("")
             }
+
+            </tbody>
+
+            </table>
+
+            </div>
+
+        </div>
+
+        `;
+
+
+        html += conditionsHtml(
+            data.condition_list
+        );
+
+
+        html += `
+
+        <div class="card">
+
+            <div class="note">
+
+                查询日期：
+                ${data.date}
+
+                <br>
+
+                数据来源：
+                东方财富妙想官方智能选股
+
+                <br>
+
+                接口返回：
+                ${data.source || "-"}
+
+                <br>
+
+                ${
+                    data.total_condition &&
+                    data.total_condition.describe
+                    ?
+                    "组合条件："
+                    +
+                    data.total_condition.describe
+                    :
+                    ""
+                }
+
+            </div>
+
+        </div>
+
+        `;
+
+
+        result.innerHTML =
+        html;
+
+    }
+    catch(error){
+
+        result.innerHTML = `
+
+        <div class="card error">
+
+            扫描失败：
+
+            ${error}
 
             <br><br>
 
-            ${data.parser_text || ""}
-
-          </div>
+            请重新点击「开始扫描」。
 
         </div>
-        `;
 
-        result.innerHTML = html;
-
-    }
-    catch(e){
-
-        result.innerHTML = `
-          <div class="card error">
-            扫描失败：
-            ${e}
-          </div>
         `;
 
     }
     finally{
 
-        button.disabled = false;
-        button.innerText = "开始扫描";
+        button.disabled =
+        false;
+
+        button.innerText =
+        "开始扫描";
 
     }
 
@@ -1098,36 +1668,47 @@ async function doScan(){
 
 
 # =========================================================
-# 路由
+# 页面
 # =========================================================
 
-@app.get("/", response_class=HTMLResponse)
+@app.get(
+    "/",
+    response_class=HTMLResponse
+)
 def home():
-    return HTMLResponse(HTML)
+
+    return HTMLResponse(
+        HTML
+    )
 
 
-@app.get("/api/scanner")
+# =========================================================
+# API
+# =========================================================
+
+@app.get(
+    "/api/scanner"
+)
 def scanner(
     date: Optional[str] = None
 ):
 
     try:
 
-        data = scan(date)
-
-        return data
+        return run_scan(
+            date
+        )
 
     except Exception as e:
 
         return {
-            "error":
-                "妙想官方选股接口调用失败："
-                + str(e)
+            "ok": False,
+            "error": str(e)
         }
 
 
 # =========================================================
-# Render
+# Render 启动
 # =========================================================
 
 if __name__ == "__main__":
