@@ -1,2256 +1,454 @@
+# -*- coding: utf-8 -*-
+"""
+main.py — 游资 AI 选股工作模式 · 选股 / 打分 / 买卖点 脚本
+================================================================
+把用户自定义的五条选股条件、多因子打分模型、援军战法买卖点规则
+固化成可运行的 Python 脚本。
+
+用法:
+    1) 准备日线数据(CSV，每只股票一个文件，或所有股票汇总文件)。
+       列名固定为: date, open, high, low, close, volume
+       示例一行: 2026-09-29,10.50,11.20,10.40,11.05,25000000
+    2) 数据文件放入 DATA_DIR 目录(默认 ./data/*.csv)。
+    3) 运行:  python main.py
+    4) 可选参数:
+         --top 5              # 输出前几只(默认 3)
+         --min-date 2026-01-01  # 只分析该日期之后的行情
+
+================================================================
+免责声明：本脚本为方法论与流程的实现，仅用于研究/复盘，不构成任何
+投资建议；股市有风险，所有决策与盈亏由使用者自行承担。
+================================================================
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import glob
 import os
-import json
-import re
-import time
-from typing import Optional
-
-import requests
-from fastapi import FastAPI
-from fastapi.responses import HTMLResponse
-
-app = FastAPI(title="妖股雷达")
-
-MX_API_URL = "https://mkapi2.dfcfs.com/finskillshub/api/claw/stock-screen"
-MX_APIKEY = os.getenv("MX_APIKEY", "").strip()
-TIMEOUT = 40
-
-# =========================================================
-# 5个硬条件：固定不变
-# =========================================================
-
-HARD_RULES = [
-    "① 连续5日上涨",
-    "② 30日内有过涨停",
-    "③ 收盘不破5日线",
-    "④ 堆量成交量",
-    "⑤ 底部筹码不动",
-]
-
-ALIASES = [
-    ["C1", "条件1", "条件①", "连续5日上涨", "连续5日涨", "连续5天上涨",
-     "连续上涨5日", "5日上涨"],
-    ["C2", "条件2", "条件②", "30日内有过涨停", "30日内有涨停",
-     "30日涨停", "近30日涨停", "30天涨停"],
-    ["C3", "条件3", "条件③", "收盘不破5日线", "收盘价不破5日线",
-     "不破5日线", "5日线"],
-    ["C4", "条件4", "条件④", "堆量成交量", "成交量堆量",
-     "堆量", "量能堆量"],
-    ["C5", "条件5", "条件⑤", "底部筹码不动", "底部筹码",
-     "筹码不动"],
-]
-
-
-# =========================================================
-# 基础工具
-# =========================================================
-
-def normalize(v):
-    if v is None:
-        return ""
-    if isinstance(v, bool):
-        return v
-    return str(v).strip()
-
-
-def num(v, default=0.0):
-    try:
-        if v is None:
-            return default
-
-        s = str(v).replace(",", "").replace("%", "").strip()
-
-        if s in ("", "-", "--", "None", "null", "nan"):
-            return default
-
-        return float(s)
-    except Exception:
-        return default
-
-
-def val(row, *keys, default=""):
-    if not isinstance(row, dict):
-        return default
-
-    for key in keys:
-        if key in row and str(row[key]).strip():
-            return row[key]
-
-    wanted = {
-        str(k).lower().replace(" ", "")
-        for k in keys
-    }
-
-    for k, v in row.items():
-        kk = str(k).lower().replace(" ", "")
-
-        if kk in wanted and str(v).strip():
-            return v
-
-    return default
-
-
-def as_list(v):
-    if isinstance(v, list):
-        return v
-
-    if isinstance(v, dict):
-        for k in [
-            "dataList",
-            "rows",
-            "items",
-            "records",
-            "list",
-            "data",
-            "result",
-            "results",
-        ]:
-            x = v.get(k)
-
-            if isinstance(x, list):
-                return x
-
-            if isinstance(x, dict):
-                y = as_list(x)
-
-                if y:
-                    return y
-
-    return []
-
-
-# =========================================================
-# Markdown 表格
-# =========================================================
-
-def parse_markdown_table(text):
-    if not isinstance(text, str):
-        return []
-
-    lines = [
-        x.strip()
-        for x in text.splitlines()
-        if "|" in x
-    ]
-
-    if len(lines) < 2:
-        return []
-
-    header_index = None
-
-    for i, line in enumerate(lines):
-
-        cells = [
-            x.strip()
-            for x in line.strip("|").split("|")
-        ]
-
-        joined = " ".join(cells)
-
-        if (
-            "股票代码" in joined
-            or "股票名称" in joined
-            or "C1" in cells
-            or "C2" in cells
-            or "C3" in cells
-            or "C4" in cells
-            or "C5" in cells
-        ):
-            header_index = i
-            break
-
-    if header_index is None:
-        return []
-
-    headers = [
-        x.strip()
-        for x in lines[header_index]
-        .strip("|")
-        .split("|")
-    ]
-
-    result = []
-
-    for line in lines[header_index + 1:]:
-
-        cells = [
-            x.strip()
-            for x in line.strip("|").split("|")
-        ]
-
-        if len(cells) != len(headers):
-            continue
-
-        if all(
-            re.fullmatch(r"[-: ]+", x or "")
-            for x in cells
-        ):
-            continue
-
-        result.append(
-            dict(zip(headers, cells))
-        )
-
-    return result
-
-
-# =========================================================
-# 解析接口返回
-# =========================================================
-
-def unwrap(data):
-
-    rows = as_list(data)
-
-    if rows:
-        return rows
-
-    def walk(x, depth=0):
-
-        if depth > 10:
-            return []
-
-        if isinstance(x, list):
-
-            if x and all(
-                isinstance(i, dict)
-                for i in x
-            ):
-                return x
-
-            for item in x:
-                r = walk(item, depth + 1)
-
-                if r:
-                    return r
-
-        if isinstance(x, dict):
-
-            for k in [
-                "dataList",
-                "rows",
-                "items",
-                "records",
-                "list",
-                "result",
-                "results",
-                "data",
-            ]:
-
-                if k in x:
-
-                    r = as_list(x[k])
-
-                    if r:
-                        return r
-
-            for v in x.values():
-
-                r = walk(v, depth + 1)
-
-                if r:
-                    return r
-
-        if isinstance(x, str):
-            return parse_markdown_table(x)
-
-        return []
-
-    return walk(data)
-
-
-# =========================================================
-# 是 / 否判断
-# =========================================================
-
-def bool_condition(v):
-
-    if isinstance(v, bool):
-        return v
-
-    if isinstance(v, (int, float)):
-
-        if v == 1:
-            return True
-
-        if v == 0:
-            return False
-
-    s = normalize(v)
-
-    s = re.sub(
-        r"\s+",
-        "",
-        s
-    ).lower()
-
-    if not s:
-        return None
-
-    yes = {
-        "是",
-        "满足",
-        "符合",
-        "有",
-        "true",
-        "1",
-        "yes",
-        "y",
-        "√",
-        "✓",
-        "✔",
-        "满足条件",
-        "符合条件",
-    }
-
-    no = {
-        "否",
-        "不满足",
-        "不符合",
-        "无",
-        "false",
-        "0",
-        "no",
-        "n",
-        "×",
-        "✕",
-        "✖",
-        "不满足条件",
-        "不符合条件",
-    }
-
-    if s in yes:
-        return True
-
-    if s in no:
-        return False
-
-    return None
-
-
-# =========================================================
-# 缺少条件
-# =========================================================
-
-def get_missing_text(row):
-
-    result = []
-
-    for key in [
-        "缺少条件",
-        "缺失条件",
-        "未满足条件",
-        "不满足条件",
-        "差的条件",
-        "missing",
-        "missing_conditions",
-    ]:
-
-        if key in row:
-
-            text = str(row[key]).strip()
-
-            if text:
-                result.append(text)
-
-    return " ".join(result)
-
-
-def missing_indices(text):
-
-    result = set()
-
-    if not text:
+import sys
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Tuple
+
+# ----------------------------------------------------------------------
+# 0. 配置
+# ----------------------------------------------------------------------
+DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
+TOP_N_DEFAULT = 3          # 默认输出前 3 只
+LIMIT_UP_RATIO = 0.098     # 涨停判定阈值(主板≈10%，留出小数误差)
+CONSEC_UP_DAYS = 5         # 连续上涨天数要求
+LIMIT_UP_LOOKBACK = 30     # 30 日内有涨停
+MA_WINDOW = 5              # 5 日线
+
+# 多因子打分权重(用户自定义，和为 1.0)
+FACTOR_WEIGHTS = {
+    "题材强度": 0.25,
+    "卡位辨识度": 0.20,
+    "板块效应": 0.15,
+    "量价封单": 0.15,
+    "资金合力": 0.15,
+    "情绪阶段适配": 0.10,
+}
+
+# ----------------------------------------------------------------------
+# 1. 数据模型与读取
+# ----------------------------------------------------------------------
+@dataclass
+class Bar:
+    date: str
+    open: float
+    high: float
+    low: float
+    close: float
+    volume: float
+
+
+def read_csv(path: str) -> List[Bar]:
+    """读取一个 OHLCV 日线 CSV，按日期升序返回 Bar 列表。"""
+    bars: List[Bar] = []
+    with open(path, "r", encoding="utf-8-sig", newline="") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            try:
+                bars.append(
+                    Bar(
+                        date=row["date"].strip(),
+                        open=float(row["open"]),
+                        high=float(row["high"]),
+                        low=float(row["low"]),
+                        close=float(row["close"]),
+                        volume=float(row["volume"]),
+                    )
+                )
+            except (KeyError, ValueError) as e:
+                print(f"  [跳过] {path} 解析失败: {row} ({e})")
+    bars.sort(key=lambda b: b.date)
+    return bars
+
+
+def load_all_bars(data_dir: str, min_date: Optional[str] = None) -> Dict[str, List[Bar]]:
+    """加载 data_dir 下所有 *.csv，返回 {文件名: bars}。"""
+    result: Dict[str, List[Bar]] = {}
+    if not os.path.isdir(data_dir):
+        print(f"[警告] 数据目录不存在: {data_dir}")
         return result
-
-    text = str(text)
-
-    for i, aliases in enumerate(ALIASES):
-
-        for alias in aliases:
-
-            if alias in text:
-
-                result.add(i)
-
-                break
-
-    for i in range(5):
-
-        n = i + 1
-
-        if re.search(
-            rf"\bC{n}\b",
-            text,
-            re.I
-        ):
-            result.add(i)
-
-        if f"条件{n}" in text:
-            result.add(i)
-
+    for path in sorted(glob.glob(os.path.join(data_dir, "*.csv"))):
+        bars = read_csv(path)
+        if min_date:
+            bars = [b for b in bars if b.date >= min_date]
+        if len(bars) >= MA_WINDOW + 1:
+            name = os.path.splitext(os.path.basename(path))[0]
+            result[name] = bars
     return result
 
 
-# =========================================================
-# 获取接口返回的 3/5、4/5、5/5
-# =========================================================
-
-def hard_count_from_row(row):
-
-    for key in [
-        "硬条件",
-        "硬条件数量",
-        "条件数量",
-        "满足条件数",
-        "hard",
-        "hard_count",
-    ]:
-
-        if key not in row:
-            continue
-
-        text = str(row[key])
-
-        m = re.search(
-            r"([0-5])\s*/\s*5",
-            text
-        )
-
-        if m:
-            return int(m.group(1))
-
-        m = re.fullmatch(
-            r"\s*([0-5])\s*",
-            text
-        )
-
-        if m:
-            return int(m.group(1))
-
-    text = json.dumps(
-        row,
-        ensure_ascii=False
-    )
-
-    m = re.search(
-        r"([0-5])\s*/\s*5",
-        text
-    )
-
-    if m:
-        return int(m.group(1))
-
-    return None
+# ----------------------------------------------------------------------
+# 2. 技术指标
+# ----------------------------------------------------------------------
+def sma(values: List[float], window: int) -> List[Optional[float]]:
+    """简单移动平均，前面 window-1 个为 None。"""
+    out: List[Optional[float]] = [None] * len(values)
+    if len(values) < window:
+        return out
+    s = sum(values[:window])
+    out[window - 1] = s / window
+    for i in range(window, len(values)):
+        s += values[i] - values[i - window]
+        out[i] = s / window
+    return out
 
 
-# =========================================================
-# 判断5个硬条件
-# =========================================================
-
-def get_conditions(row):
-
-    conditions = [None] * 5
-
-    # 第一层：直接读取 C1-C5
-    for i, aliases in enumerate(ALIASES):
-
-        for key in aliases:
-
-            if key in row:
-
-                value = bool_condition(
-                    row[key]
-                )
-
-                if value is not None:
-
-                    conditions[i] = value
-
-                    break
-
-        if conditions[i] is not None:
-            continue
-
-        wanted = {
-            str(x).lower().replace(" ", "")
-            for x in aliases
-        }
-
-        for rk, rv in row.items():
-
-            kk = str(rk).lower().replace(" ", "")
-
-            if kk in wanted:
-
-                value = bool_condition(rv)
-
-                if value is not None:
-
-                    conditions[i] = value
-
-                    break
-
-    # 第二层：从文字中识别
-    text = json.dumps(
-        row,
-        ensure_ascii=False
-    )
-
-    for i, aliases in enumerate(ALIASES):
-
-        if conditions[i] is not None:
-            continue
-
-        for alias in aliases:
-
-            pattern = (
-                re.escape(alias)
-                + r"\s*[:：=]\s*"
-                + r"(是|否|满足|不满足|符合|不符合)"
-            )
-
-            m = re.search(
-                pattern,
-                text,
-                re.I
-            )
-
-            if m:
-
-                conditions[i] = bool_condition(
-                    m.group(1)
-                )
-
-                break
-
-    # 第三层：利用“缺少条件”
-    missing_text = get_missing_text(row)
-
-    for i in missing_indices(
-        missing_text
-    ):
-        conditions[i] = False
-
-    # 第四层：利用接口直接返回的 3/5、4/5、5/5
-    count = hard_count_from_row(row)
-
-    if count is not None:
-
-        true_count = sum(
-            x is True
-            for x in conditions
-        )
-
-        unknown = [
-            i
-            for i, x in enumerate(conditions)
-            if x is None
-        ]
-
-        need_true = count - true_count
-
-        # 逻辑可以唯一确定时才补
-        if need_true == 0:
-
-            for i in unknown:
-                conditions[i] = False
-
-        elif need_true == len(unknown):
-
-            for i in unknown:
-                conditions[i] = True
-
-    return conditions
+def pct_change(closes: List[float]) -> List[Optional[float]]:
+    out: List[Optional[float]] = [None]
+    for i in range(1, len(closes)):
+        prev = closes[i - 1]
+        out.append(None if prev == 0 else (closes[i] - prev) / prev)
+    return out
 
 
-# =========================================================
-# 综合评分
-# =========================================================
+def is_limit_up(bar: Bar, prev_close: Optional[float]) -> bool:
+    """当日是否涨停(近似判定，阈值由 LIMIT_UP_RATIO 控制)。"""
+    if prev_close is None or prev_close <= 0:
+        return False
+    return (bar.close - prev_close) / prev_close >= LIMIT_UP_RATIO - 1e-6
+
+
+# ----------------------------------------------------------------------
+# 3. 五条选股条件
+# ----------------------------------------------------------------------
+def condition_5_consec_up(bars: List[Bar]) -> bool:
+    """条件1: 连续5日上涨(收盘价逐日走高)。"""
+    if len(bars) < CONSEC_UP_DAYS:
+        return False
+    tail = bars[-CONSEC_UP_DAYS:]
+    return all(tail[i].close > tail[i - 1].close for i in range(1, len(tail)))
+
+
+def condition_limit_up_in_30d(bars: List[Bar]) -> bool:
+    """条件2: 30 日内有过涨停。"""
+    if len(bars) < 2:
+        return False
+    lookback = bars[-LIMIT_UP_LOOKBACK:]
+    for i in range(1, len(lookback)):
+        if is_limit_up(lookback[i], lookback[i - 1].close):
+            return True
+    return False
+
+
+def condition_close_above_ma5(bars: List[Bar]) -> bool:
+    """条件3: 收盘价不破 5 日线(最新收盘 >= 5日均线)。"""
+    closes = [b.close for b in bars]
+    ma5 = sma(closes, MA_WINDOW)
+    return ma5[-1] is not None and closes[-1] >= ma5[-1]
+
+
+def condition_volume_accumulation(bars: List[Bar]) -> bool:
+    """条件4: 成交量堆量——近期成交量温和放大且呈台阶式堆高。
+
+    简化口径: 近 5 日均量 > 前 20 日均量 × 1.1，且近 5 日内没有单日
+    极度放量后立刻大幅缩量(避免脉冲量)。
+    """
+    if len(bars) < 25:
+        return False
+    recent = [b.volume for b in bars[-5:]]
+    base = [b.volume for b in bars[-25:-5]]
+    avg_recent = sum(recent) / len(recent)
+    avg_base = sum(base) / len(base)
+    if avg_base <= 0:
+        return False
+    # 堆量: 近端均量放大
+    if avg_recent < avg_base * 1.1:
+        return False
+    # 剔除"脉冲量": 最近一日的量不低于近5日均量的 60%
+    return recent[-1] >= avg_recent * 0.6
+
+
+def condition_bottom_chips_stable(bars: List[Bar]) -> bool:
+    """条件5: 底部筹码不动。
+
+    用"缩量回调不破底"作为筹码稳定代理指标: 最近 20 日内，若股价较
+    区间最低点回调，回调段成交量明显小于拉升段，且最新价仍在区间
+    高位(未跌破前低)，视为底部筹码锁定。
+    """
+    if len(bars) < 21:
+        return False
+    window = bars[-21:]
+    low_price = min(b.low for b in window)
+    high_price = max(b.high for b in window)
+    if high_price <= 0 or low_price <= 0:
+        return False
+    cur = bars[-1]
+    # 仍在区间相对高位(距最高点回撤 < 15%)且未创新低
+    drawdown = (high_price - cur.close) / high_price
+    if drawdown > 0.15:
+        return False
+    # 近 3 日最低价不显著低于区间低位(防止放量破位)
+    recent_low = min(b.low for b in bars[-3:])
+    if recent_low < low_price * 0.97:
+        return False
+    return True
+
+
+# ----------------------------------------------------------------------
+# 4. 多因子打分(用户自定义透明模型, 每因子 0-10)
+# ----------------------------------------------------------------------
+@dataclass
+class StockScore:
+    name: str
+    factors: Dict[str, float] = field(default_factory=dict)
+    total: float = 0.0
+
 
 def score_stock(
-    hard_count,
-    pct,
-    turnover,
-    lhb_net
-):
+    name: str,
+    bars: List[Bar],
+    factor_inputs: Optional[Dict[str, float]] = None,
+) -> Optional[StockScore]:
+    """对单只股票打分。
 
-    score = hard_count * 15
+    factor_inputs 提供无法从 OHLCV 直接算出的因子(题材强度/卡位辨识度/
+    板块效应/资金合力/情绪阶段适配)，由人工或外部数据补充(0-10)。
+    若未提供，则用内部技术代理口径估算并注明"代理分"。
+    """
+    if factor_inputs is None:
+        factor_inputs = {}
 
-    if pct >= 9:
-        score += 10
+    closes = [b.close for b in bars]
+    vols = [b.volume for b in bars]
+    pc = pct_change(closes)
 
-    elif pct >= 5:
-        score += 7
+    # --- 技术代理因子(0-10) ---
+    ma5 = sma(closes, MA_WINDOW)
 
-    elif pct >= 3:
-        score += 4
+    # 量价封单: 由涨停存在性 + 堆量 + 收盘贴近5日线(强势) 估算
+    up_days = sum(1 for p in pc if p is not None and p > 0)
+    ratio_up = up_days / max(len(closes) - 1, 1)
+    has_lu = condition_limit_up_in_30d(bars)
+    score_lp = min(10.0, ratio_up * 12.0 + (4.0 if has_lu else 0.0) + 2.0)
 
-    if turnover >= 20:
-        score += 10
+    # 情绪阶段适配: 连续上涨 + 站上5日线 视为适配发酵/高潮
+    score_sent = min(10.0, (5.0 if condition_5_consec_up(bars) else 0.0)
+                     + (3.0 if condition_close_above_ma5(bars) else 0.0) + 2.0)
 
-    elif turnover >= 10:
-        score += 7
+    # 外部/代理因子合并: 优先用外部输入, 否则用代理口径
+    factors = {
+        "题材强度": factor_inputs.get("题材强度", 5.0),
+        "卡位辨识度": factor_inputs.get("卡位辨识度", 5.0),
+        "板块效应": factor_inputs.get("板块效应", 5.0),
+        "量价封单": factor_inputs.get("量价封单", round(score_lp, 2)),
+        "资金合力": factor_inputs.get("资金合力", 5.0),
+        "情绪阶段适配": factor_inputs.get("情绪阶段适配", round(score_sent, 2)),
+    }
 
-    elif turnover >= 5:
-        score += 4
-
-    if lhb_net > 5000:
-        score += 10
-
-    elif lhb_net > 1000:
-        score += 7
-
-    elif lhb_net > 0:
-        score += 4
-
-    return min(
-        round(score, 1),
-        100
-    )
-
-
-# =========================================================
-# 买点 / 持有 / 卖点
-# =========================================================
-
-def rule_buy(row):
-
-    text = json.dumps(
-        row,
-        ensure_ascii=False
-    )
-
-    names = [
-        "援军战法",
-        "反转阴",
-        "仙人指路",
-        "双剑合璧",
-        "倚天剑",
-        "屠龙刀",
-    ]
-
-    found = [
-        x for x in names
-        if x in text
-    ]
-
-    if found:
-        return "；".join(found)
-
-    return "等待回踩确认"
+    total = sum(FACTOR_WEIGHTS[k] * factors[k] for k in FACTOR_WEIGHTS)
+    return StockScore(name=name, factors=factors, total=round(total, 2))
 
 
-def rule_hold(row):
-
-    return (
-        "高点高、低点高、收盘高；"
-        "保持趋势向上"
-    )
-
-
-def rule_sell(row):
-
-    return (
-        "高点不再创新高，"
-        "收盘未站上前一日，"
-        "低点跌破前一日低点时重点观察"
-    )
+# ----------------------------------------------------------------------
+# 5. 买卖点规则(援军战法 / 三种阴线 / 三高三低)
+# ----------------------------------------------------------------------
+@dataclass
+class TradePlan:
+    name: str
+    buy_point: str
+    hold_rule: str
+    sell_point: str
+    triggered_rules: List[str]
 
 
-def rule_signals(row):
+def analyze_trade(name: str, bars: List[Bar]) -> TradePlan:
+    """给出买点/持有/卖点, 并回填触发了哪些规则。"""
+    closes = [b.close for b in bars]
+    highs = [b.high for b in bars]
+    lows = [b.low for b in bars]
+    triggered: List[str] = []
 
-    text = json.dumps(
-        row,
-        ensure_ascii=False
-    )
-
-    names = [
-        "援军战法",
-        "破位阴",
-        "加速阴",
-        "反转阴",
-        "九阴九阳",
-        "仙人指路",
-        "双剑合璧",
-        "倚天剑",
-        "屠龙刀",
-    ]
-
-    found = [
-        x for x in names
-        if x in text
-    ]
-
-    return found or ["趋势确认"]
-
-
-# =========================================================
-# 单只股票
-# =========================================================
-
-def build_stock(row):
-
-    conditions = get_conditions(row)
-
-    # 完全拿不到条件，才放弃
-    if all(
-        x is None
-        for x in conditions
-    ):
-        return None
-
-    # 未知条件绝不算“满足”
-    conditions = [
-        False if x is None else x
-        for x in conditions
-    ]
-
-    hard_count = sum(
-        1
-        for x in conditions
-        if x
-    )
-
-    # 0-2 过滤
-    if hard_count < 3:
-        return None
-
-    code = normalize(
-        val(
-            row,
-            "股票代码",
-            "代码",
-            "证券代码",
-            "code",
-            "CODE"
-        )
-    )
-
-    name = normalize(
-        val(
-            row,
-            "股票名称",
-            "名称",
-            "证券名称",
-            "name",
-            "NAME"
-        )
-    )
-
-    price = num(
-        val(
-            row,
-            "最新价",
-            "现价",
-            "收盘价",
-            "price"
-        )
-    )
-
-    pct = num(
-        val(
-            row,
-            "涨跌幅",
-            "涨幅",
-            "pct",
-            "change_pct",
-            "涨跌"
-        )
-    )
-
-    turnover = num(
-        val(
-            row,
-            "换手率",
-            "turnover",
-            "换手"
-        )
-    )
-
-    market_cap = num(
-        val(
-            row,
-            "总市值",
-            "市值",
-            "market_cap",
-            "总市值(亿)"
-        )
-    )
-
-    lhb_net = num(
-        val(
-            row,
-            "龙虎榜净买额",
-            "龙虎榜净额",
-            "龙虎榜净买",
-            "lhb_net"
-        )
-    )
-
-    zt_count = num(
-        val(
-            row,
-            "近30日涨停次数",
-            "30日涨停次数",
-            "涨停次数",
-            "zt_count"
-        )
-    )
-
-    if hard_count == 5:
-
-        category = "5/5"
-        category_name = "🔴 强势"
-
-    elif hard_count == 4:
-
-        category = "4/5"
-        category_name = "🟠 高度接近"
-
+    # --- 援军战法: 重挫后企稳不再创新低 ---
+    recent_low = min(lows[-15:])          # 近期低点
+    last_low = lows[-1]
+    stabilized = last_low >= recent_low and last_low <= recent_low * 1.02
+    if stabilized:
+        buy_point = f"援军战法: 近期低点约 {recent_low:.2f} 已企稳不再创新低，低点附近作为买点/撤军点"
+        triggered.append("援军战法(企稳不创新低)")
     else:
+        buy_point = f"尚未企稳(最新低 {last_low:.2f} 距区间低 {recent_low:.2f})，先观察不急着接"
 
-        category = "3/5"
-        category_name = "🟡 观察"
-
-    missing = [
-        HARD_RULES[i]
-        for i, ok in enumerate(conditions)
-        if not ok
-    ]
-
-    buy = normalize(
-        val(
-            row,
-            "买点",
-            "买入点",
-            "买点提示"
-        )
-    )
-
-    hold = normalize(
-        val(
-            row,
-            "持有",
-            "持股",
-            "持有提示"
-        )
-    )
-
-    sell = normalize(
-        val(
-            row,
-            "卖点",
-            "卖出",
-            "卖点提示"
-        )
-    )
-
-    return {
-        "code": code,
-        "name": name,
-        "price": price,
-        "pct": pct,
-        "turnover": turnover,
-        "market_cap": market_cap,
-        "lhb_net": lhb_net,
-        "zt_count": zt_count,
-
-        "conditions": conditions,
-
-        "hard": hard_count,
-        "hard_text": f"{hard_count}/5",
-
-        "category": category,
-        "category_name": category_name,
-
-        "missing": missing,
-
-        "missing_text": (
-            "、".join(missing)
-            if missing
-            else "无"
-        ),
-
-        "score": score_stock(
-            hard_count,
-            pct,
-            turnover,
-            lhb_net
-        ),
-
-        "buy": buy or rule_buy(row),
-        "hold": hold or rule_hold(row),
-        "sell": sell or rule_sell(row),
-
-        "signals": rule_signals(row),
-    }
-
-
-# =========================================================
-# 妙想查询
-# =========================================================
-
-def build_query(date):
-
-    return f"""
-你是A股短线选股数据分析器。
-
-交易日期：{date}
-
-请返回满足3/5、4/5、5/5的股票。
-不要只返回5/5。
-
-五个硬条件固定为：
-
-C1：连续5日上涨
-C2：30日内有过涨停
-C3：收盘不破5日线
-C4：堆量成交量
-C5：底部筹码不动
-
-严格要求：
-
-1、每只股票必须明确返回C1、C2、C3、C4、C5。
-2、C1-C5只能填写“是”或“否”。
-3、返回“满足条件数”，格式为3/5、4/5或5/5。
-4、返回“缺少条件”。
-5、4/5只能缺1项。
-6、3/5只能缺2项。
-7、不能把4/5或3/5标成5/5。
-8、0-2/5不要返回。
-
-同时返回：
-
-股票代码
-股票名称
-最新价
-涨跌幅
-换手率
-总市值
-龙虎榜净买额
-近30日涨停次数
-C1
-C2
-C3
-C4
-C5
-满足条件数
-缺少条件
-买点
-持有
-卖点
-触发规则
-
-只返回股票数据。
-"""
-
-
-def mx_search(query):
-
-    if not MX_APIKEY:
-
-        raise RuntimeError(
-            "未读取到 MX_APIKEY，请检查 Render 环境变量。"
-        )
-
-    headers = {
-        "Content-Type": "application/json",
-        "apikey": MX_APIKEY,
-        "Authorization": f"Bearer {MX_APIKEY}",
-    }
-
-    payload = {
-        "query": query
-    }
-
-    last_error = None
-
-    for attempt in range(3):
-
-        try:
-
-            response = requests.post(
-                MX_API_URL,
-                headers=headers,
-                json=payload,
-                timeout=TIMEOUT
-            )
-
-            response.raise_for_status()
-
-            return response.json()
-
-        except Exception as e:
-
-            last_error = e
-
-            if attempt < 2:
-                time.sleep(1.5)
-
-    raise RuntimeError(
-        f"数据接口请求失败：{last_error}"
-    )
-
-
-# =========================================================
-# 扫描
-# =========================================================
-
-def scan(date=None):
-
-    if not date:
-
-        date = time.strftime(
-            "%Y-%m-%d"
-        )
-
-    raw = mx_search(
-        build_query(date)
-    )
-
-    rows = unwrap(raw)
-
-    if not rows:
-
-        return {
-            "ok": True,
-            "date": date,
-            "top3": [],
-            "top3_type": "",
-            "top3_note": "",
-            "strong": [],
-            "near": [],
-            "watch": [],
-            "ranking": [],
-            "counts": {
-                "5/5": 0,
-                "4/5": 0,
-                "3/5": 0
-            },
-            "message": "接口没有返回有效股票数据。",
-        }
-
-    stocks = []
-
-    for row in rows:
-
-        if not isinstance(row, dict):
+    # --- 三种阴线识别(最近 3 根 K 线) ---
+    yin_info = ""
+    for i in range(max(1, len(bars) - 3), len(bars)):
+        b = bars[i]
+        is_yin = b.close < b.open
+        if not is_yin:
             continue
+        prev = bars[i - 1]
+        # 破位阴: 收盘跌破前低
+        if b.close < prev.low:
+            yin_info = f"最近出现破位阴({b.date})，警惕破位，不宜低吸"
+            if "破位阴" not in triggered:
+                triggered.append("破位阴(警示)")
+        # 加速阴: 跌幅明显大于前一日且放量
+        elif prev.close > 0 and (prev.close - b.close) / prev.close > 0.03 and b.volume > prev.volume:
+            yin_info = f"最近出现加速阴({b.date})，急跌中不接飞刀"
+            if "加速阴" not in triggered:
+                triggered.append("加速阴(警示)")
+        # 反转阴: 冲高回落的缩量阴线，次日若企稳为买点
+        elif b.high > prev.high and b.close > prev.low and b.volume < prev.volume:
+            yin_info = f"最近出现反转阴({b.date})，低点附近可作为买点(配合援军)"
+            if "反转阴(低吸买点)" not in triggered:
+                triggered.append("反转阴(低吸买点)")
+    if yin_info:
+        buy_point = f"{buy_point} | {yin_info}"
 
-        try:
+    # --- 三高三低(持股/卖点) ---
+    if len(closes) >= 3:
+        c0, c1 = closes[-1], closes[-2]
+        h0, h1 = highs[-1], highs[-2]
+        l0, l1 = lows[-1], lows[-2]
+        # 卖出信号: 高点不创新高 / 收盘不高于昨日 / 最低点不高于昨日最低
+        sell_signals = []
+        if h0 <= h1:
+            sell_signals.append("高点不创新高")
+        if c0 <= c1:
+            sell_signals.append("收盘价不高于昨日")
+        if l0 <= l1:
+            sell_signals.append("最低点不高于昨日最低")
+        # 持有信号: 高点高 / 低点高 / 收盘价高
+        hold_signals = []
+        if h0 > h1:
+            hold_signals.append("高点高")
+        if l0 > l1:
+            hold_signals.append("低点高")
+        if c0 > c1:
+            hold_signals.append("收盘价高")
 
-            stock = build_stock(row)
+        if sell_signals and len(sell_signals) >= 2:
+            sell_point = "三不高触发 → " + "、".join(sell_signals) + "，减仓/离场"
+            triggered.append("三不高(卖点): " + "、".join(sell_signals))
+        elif sell_signals:
+            sell_point = "出现 1 个卖点信号(" + "、".join(sell_signals) + ")，先留意"
+            triggered.append("三不高(部分): " + "、".join(sell_signals))
+        else:
+            sell_point = "三不高未触发，暂无卖点信号"
 
-            if stock:
-                stocks.append(stock)
-
-        except Exception:
-            continue
-
-    # 同一股票去重
-    unique = {}
-
-    for stock in stocks:
-
-        key = (
-            stock["code"]
-            or stock["name"]
-        )
-
-        if not key:
-            continue
-
-        if (
-            key not in unique
-            or stock["score"]
-            > unique[key]["score"]
-        ):
-            unique[key] = stock
-
-    stocks = list(
-        unique.values()
-    )
-
-    # 排序：硬条件优先，再综合评分
-    def sort_key(x):
-
-        return (
-            -x["hard"],
-            -x["score"],
-            -x["pct"],
-            -x["turnover"]
-        )
-
-    strong = sorted(
-        [
-            x for x in stocks
-            if x["hard"] == 5
-        ],
-        key=sort_key
-    )
-
-    near = sorted(
-        [
-            x for x in stocks
-            if x["hard"] == 4
-        ],
-        key=sort_key
-    )
-
-    watch = sorted(
-        [
-            x for x in stocks
-            if x["hard"] == 3
-        ],
-        key=sort_key
-    )
-
-    # 各池独立排名
-    for i, stock in enumerate(
-        strong,
-        1
-    ):
-
-        stock["rank"] = i
-        stock["pool"] = "5/5"
-
-    for i, stock in enumerate(
-        near,
-        1
-    ):
-
-        stock["rank"] = i
-        stock["pool"] = "4/5"
-
-    for i, stock in enumerate(
-        watch,
-        1
-    ):
-
-        stock["rank"] = i
-        stock["pool"] = "3/5"
-
-    # =====================================================
-    # TOP3
-    # =====================================================
-
-    if strong:
-
-        top3 = strong[:3]
-
-        top3_type = "5/5"
-
-        top3_note = ""
-
-    elif near:
-
-        top3 = near[:3]
-
-        top3_type = "4/5"
-
-        top3_note = (
-            "今日无5/5，以下为4/5替补"
-        )
-
+        if hold_signals and len(hold_signals) == 3:
+            hold_rule = "三高齐备 → " + "、".join(hold_signals) + "，可持股/持有"
+            if "三高(持有)" not in triggered:
+                triggered.append("三高(持有): " + "、".join(hold_signals))
+        elif hold_signals:
+            hold_rule = "部分三高信号(" + "、".join(hold_signals) + ")，继续观察"
+        else:
+            hold_rule = "未现三高信号，倾向防守"
     else:
+        sell_point = "数据不足，无法判定卖点"
+        hold_rule = "数据不足"
 
-        top3 = []
-
-        top3_type = ""
-
-        top3_note = (
-            "今日没有5/5和4/5，"
-            "3/5仅作为观察池。"
-        )
-
-    return {
-        "ok": True,
-        "date": date,
-
-        "top3": top3,
-        "top3_type": top3_type,
-        "top3_note": top3_note,
-
-        "strong": strong,
-        "near": near,
-        "watch": watch,
-
-        "ranking":
-            strong + near + watch,
-
-        "counts": {
-            "5/5": len(strong),
-            "4/5": len(near),
-            "3/5": len(watch)
-        },
-
-        "message": "",
-    }
+    return TradePlan(name=name, buy_point=buy_point,
+                     hold_rule=hold_rule, sell_point=sell_point,
+                     triggered_rules=triggered)
 
 
-# =========================================================
-# API
-# =========================================================
+# ----------------------------------------------------------------------
+# 6. 主流程
+# ----------------------------------------------------------------------
+def main() -> None:
+    parser = argparse.ArgumentParser(description="游资 AI 选股工作模式·选股/打分/买卖点")
+    parser.add_argument("--data", default=DATA_DIR, help="存放 OHLCV CSV 的目录(默认 ./data)")
+    parser.add_argument("--top", type=int, default=TOP_N_DEFAULT, help="输出前几只(默认 3)")
+    parser.add_argument("--min-date", default=None, help="只分析该日期之后的行情, 如 2026-01-01")
+    parser.add_argument("--show-all", action="store_true", help="打印全部通过条件股票的明细打分")
+    args = parser.parse_args()
 
-@app.get("/api/scanner")
-def scanner(
-    date: Optional[str] = None
-):
+    print("=" * 66)
+    print("游资 AI 选股工作模式 · 筛选与打分")
+    print("=" * 66)
 
-    try:
+    all_data = load_all_bars(args.data, args.min_date)
+    if not all_data:
+        print(f"[错误] {args.data} 下没有可用的 CSV 数据。")
+        print("请准备列名为 date,open,high,low,close,volume 的日线数据。")
+        sys.exit(1)
 
-        return scan(date)
-
-    except Exception as e:
-
-        return {
-            "ok": False,
-            "error": str(e)
+    # 第一步: 五条选股条件过滤
+    passed: Dict[str, List[Bar]] = {}
+    print("\n[步骤1] 五条选股条件过滤:")
+    for name, bars in all_data.items():
+        checks = {
+            "连续5日上涨": condition_5_consec_up(bars),
+            "30日内涨停": condition_limit_up_in_30d(bars),
+            "收盘不破5日线": condition_close_above_ma5(bars),
+            "成交量堆量": condition_volume_accumulation(bars),
+            "底部筹码不动": condition_bottom_chips_stable(bars),
         }
-
-
-# =========================================================
-# 手机网页
-# =========================================================
-
-HTML = r"""
-<!DOCTYPE html>
-<html lang="zh-CN">
-
-<head>
-
-<meta charset="UTF-8">
-
-<meta name="viewport"
-content="width=device-width,
-initial-scale=1,
-maximum-scale=1,
-user-scalable=no">
-
-<title>🔥 妖股雷达</title>
-
-<style>
-
-*{
-box-sizing:border-box;
-}
-
-body{
-margin:0;
-background:#08090b;
-color:#eee;
-font-family:
--apple-system,
-BlinkMacSystemFont,
-"PingFang SC",
-"Microsoft YaHei",
-sans-serif;
-}
-
-.container{
-width:min(1200px,94%);
-margin:auto;
-padding:18px 0 50px;
-}
-
-.header{
-padding:18px;
-background:#111318;
-border:1px solid #252932;
-border-radius:16px;
-margin-bottom:14px;
-}
-
-.title{
-font-size:28px;
-font-weight:800;
-}
-
-.sub{
-color:#8f96a3;
-margin-top:6px;
-font-size:13px;
-}
-
-.toolbar{
-display:flex;
-gap:10px;
-margin-top:16px;
-flex-wrap:wrap;
-}
-
-input,
-button{
-border:0;
-border-radius:10px;
-padding:11px 14px;
-font-size:15px;
-}
-
-input{
-background:#080a0d;
-border:1px solid #30343d;
-color:#fff;
-}
-
-button{
-background:#e53935;
-color:#fff;
-font-weight:700;
-}
-
-.rules{
-display:grid;
-grid-template-columns:
-repeat(5,1fr);
-gap:8px;
-margin-top:15px;
-}
-
-.rule{
-background:#0b0d11;
-border:1px solid #252932;
-border-radius:10px;
-padding:10px;
-text-align:center;
-font-size:13px;
-}
-
-.section{
-margin-top:18px;
-}
-
-.section-title{
-font-size:20px;
-font-weight:800;
-margin:12px 0;
-}
-
-.notice{
-background:#17130b;
-border:1px solid #4b3511;
-color:#ffbd4a;
-padding:12px;
-border-radius:10px;
-margin-bottom:12px;
-}
-
-.cards{
-display:grid;
-grid-template-columns:
-repeat(3,1fr);
-gap:12px;
-}
-
-.card{
-background:#111318;
-border:1px solid #292d36;
-border-radius:15px;
-padding:15px;
-}
-
-.card.red{
-border-color:#6b2020;
-}
-
-.card.orange{
-border-color:#704817;
-}
-
-.card.yellow{
-border-color:#665616;
-}
-
-.stock-head{
-display:flex;
-justify-content:space-between;
-align-items:center;
-}
-
-.stock-name{
-font-size:20px;
-font-weight:800;
-}
-
-.code{
-color:#858c99;
-font-size:12px;
-margin-top:3px;
-}
-
-.score{
-font-size:22px;
-font-weight:900;
-}
-
-.red-text{
-color:#ff4d4f;
-}
-
-.orange-text{
-color:#ff9f43;
-}
-
-.yellow-text{
-color:#ffd84d;
-}
-
-.info{
-display:grid;
-grid-template-columns:
-1fr 1fr;
-gap:7px;
-margin-top:13px;
-}
-
-.info div{
-background:#0b0d11;
-padding:8px;
-border-radius:8px;
-font-size:12px;
-}
-
-.hard{
-margin-top:12px;
-font-size:16px;
-font-weight:800;
-}
-
-.missing{
-margin-top:8px;
-padding:9px;
-border-radius:8px;
-background:#20110f;
-color:#ff887e;
-font-size:13px;
-}
-
-.good{
-margin-top:8px;
-padding:9px;
-border-radius:8px;
-background:#0c1b12;
-color:#58dc88;
-font-size:13px;
-}
-
-.rules-box{
-margin-top:10px;
-color:#b7bdc9;
-font-size:12px;
-line-height:1.7;
-}
-
-.trade{
-margin-top:12px;
-border-top:1px solid #292d36;
-padding-top:10px;
-font-size:12px;
-line-height:1.7;
-}
-
-.table-wrap{
-overflow:auto;
-background:#111318;
-border:1px solid #292d36;
-border-radius:12px;
-}
-
-table{
-width:100%;
-border-collapse:collapse;
-min-width:850px;
-}
-
-th,
-td{
-padding:10px;
-border-bottom:1px solid #242832;
-text-align:left;
-font-size:12px;
-}
-
-th{
-color:#8f96a3;
-background:#0d0f13;
-}
-
-.pool5{
-color:#ff4d4f;
-font-weight:800;
-}
-
-.pool4{
-color:#ff9f43;
-font-weight:800;
-}
-
-.pool3{
-color:#ffd84d;
-font-weight:800;
-}
-
-.empty{
-padding:25px;
-text-align:center;
-color:#777f8c;
-background:#111318;
-border:1px solid #292d36;
-border-radius:12px;
-}
-
-.loading{
-padding:20px;
-text-align:center;
-color:#aaa;
-}
-
-@media(max-width:800px){
-
-.rules{
-grid-template-columns:
-1fr 1fr;
-}
-
-.cards{
-grid-template-columns:1fr;
-}
-
-.title{
-font-size:24px;
-}
-
-}
-
-</style>
-
-</head>
-
-<body>
-
-<div class="container">
-
-<div class="header">
-
-<div class="title">
-🔥 妖股雷达
-</div>
-
-<div class="sub">
-5条硬条件 + 买点/持有/卖点规则 · 东方财富公开行情数据
-</div>
-
-<div class="toolbar">
-
-<input
-id="date"
-type="date">
-
-<button
-onclick="scan()">
-开始扫描
-</button>
-
-</div>
-
-<div class="rules">
-
-<div class="rule">
-① 连续5日上涨
-</div>
-
-<div class="rule">
-② 30日内有过涨停
-</div>
-
-<div class="rule">
-③ 收盘不破5日线
-</div>
-
-<div class="rule">
-④ 堆量成交量
-</div>
-
-<div class="rule">
-⑤ 底部筹码不动
-</div>
-
-</div>
-
-</div>
-
-
-<div
-id="loading"
-class="loading"
-style="display:none">
-
-正在扫描……
-
-</div>
-
-
-<div id="error"></div>
-
-
-<!-- TOP3 -->
-
-<div class="section">
-
-<div
-id="topTitle"
-class="section-title">
-
-🔴 强势 TOP3（5/5）
-
-</div>
-
-<div id="topNote"></div>
-
-<div
-id="top3"
-class="cards">
-</div>
-
-</div>
-
-
-<!-- 4/5 -->
-
-<div class="section">
-
-<div class="section-title">
-
-🟠 高度接近（4/5）
-
-</div>
-
-<div
-id="near"
-class="cards">
-</div>
-
-</div>
-
-
-<!-- 3/5 -->
-
-<div class="section">
-
-<div class="section-title">
-
-🟡 观察池（3/5）
-
-</div>
-
-<div
-id="watch"
-class="cards">
-</div>
-
-</div>
-
-
-<!-- 排名 -->
-
-<div class="section">
-
-<div class="section-title">
-
-📊 分池排名
-
-</div>
-
-<div class="table-wrap">
-
-<table>
-
-<thead>
-
-<tr>
-
-<th>池子</th>
-
-<th>排名</th>
-
-<th>股票</th>
-
-<th>硬条件</th>
-
-<th>综合评分</th>
-
-<th>涨跌幅</th>
-
-<th>换手率</th>
-
-<th>缺少条件</th>
-
-</tr>
-
-</thead>
-
-<tbody id="ranking">
-
-</tbody>
-
-</table>
-
-</div>
-
-</div>
-
-</div>
-
-
-<script>
-
-const d = new Date();
-
-document.getElementById(
-"date"
-).value =
-d.getFullYear()
-+
-"-"
-+
-String(
-d.getMonth()+1
-).padStart(2,"0")
-+
-"-"
-+
-String(
-d.getDate()
-).padStart(2,"0");
-
-
-function esc(v){
-
-if(
-v === null ||
-v === undefined
-){
-return "";
-}
-
-return String(v)
-
-.replaceAll(
-"&",
-"&amp;"
-)
-
-.replaceAll(
-"<",
-"&lt;"
-)
-
-.replaceAll(
-">",
-"&gt;"
-)
-
-.replaceAll(
-'"',
-"&quot;"
-)
-
-.replaceAll(
-"'",
-"&#039;"
-);
-
-}
-
-
-function card(s){
-
-let color =
-"yellow";
-
-let cls =
-"yellow-text";
-
-if(s.hard === 5){
-
-color =
-"red";
-
-cls =
-"red-text";
-
-}
-
-if(s.hard === 4){
-
-color =
-"orange";
-
-cls =
-"orange-text";
-
-}
-
-
-let missing = "";
-
-if(s.hard < 5){
-
-missing =
-`
-<div class="missing">
-
-缺少条件：
-${esc(
-s.missing_text
-)}
-
-</div>
-`;
-
-}else{
-
-missing =
-`
-<div class="good">
-
-5个硬条件全部满足
-
-</div>
-`;
-
-}
-
-
-let signals =
-(s.signals || [])
-.join("、");
-
-
-return `
-
-<div class="card ${color}">
-
-<div class="stock-head">
-
-<div>
-
-<div class="stock-name">
-
-${esc(
-s.name || "--"
-)}
-
-</div>
-
-<div class="code">
-
-${esc(
-s.code || "--"
-)}
-
-</div>
-
-</div>
-
-<div class="${cls}">
-
-${esc(s.score)}
-
-</div>
-
-</div>
-
-
-<div class="hard">
-
-${esc(
-s.category_name
-)}
-
-· 硬条件
-
-${esc(
-s.hard_text
-)}
-
-</div>
-
-
-${missing}
-
-
-<div class="info">
-
-<div>
-现价：
-${esc(s.price)}
-</div>
-
-<div>
-涨跌：
-${esc(s.pct)}%
-</div>
-
-<div>
-换手：
-${esc(s.turnover)}%
-</div>
-
-<div>
-市值：
-${esc(s.market_cap)}
-</div>
-
-<div>
-龙虎榜净额：
-${esc(s.lhb_net)}
-</div>
-
-<div>
-30日涨停：
-${esc(s.zt_count)}
-</div>
-
-</div>
-
-
-<div class="rules-box">
-
-触发规则：
-${esc(signals)}
-
-</div>
-
-
-<div class="trade">
-
-<b>买点：</b>
-${esc(s.buy)}
-
-<br>
-
-<b>持有：</b>
-${esc(s.hold)}
-
-<br>
-
-<b>卖点：</b>
-${esc(s.sell)}
-
-</div>
-
-</div>
-
-`;
-
-}
-
-
-function renderCards(
-id,
-rows
-){
-
-const box =
-document.getElementById(
-id
-);
-
-if(
-!rows ||
-!rows.length
-){
-
-box.innerHTML =
-`
-<div class="empty">
-
-暂无符合条件的股票
-
-</div>
-`;
-
-return;
-
-}
-
-box.innerHTML =
-rows
-.map(card)
-.join("");
-
-}
-
-
-async function scan(){
-
-const date =
-document.getElementById(
-"date"
-).value;
-
-document.getElementById(
-"loading"
-).style.display =
-"block";
-
-document.getElementById(
-"error"
-).innerHTML = "";
-
-document.getElementById(
-"topNote"
-).innerHTML = "";
-
-
-try{
-
-const response =
-await fetch(
-"/api/scanner?date="
-+
-encodeURIComponent(date)
-);
-
-const data =
-await response.json();
-
-
-if(!data.ok){
-
-throw new Error(
-data.error ||
-"扫描失败"
-);
-
-}
-
-
-const title =
-document.getElementById(
-"topTitle"
-);
-
-
-if(
-data.top3_type === "4/5"
-){
-
-title.innerText =
-"🟠 TOP3（4/5替补）";
-
-document.getElementById(
-"topNote"
-).innerHTML =
-
-`
-<div class="notice">
-
-今日无5/5，
-以下为4/5替补
-
-</div>
-`;
-
-}else{
-
-title.innerText =
-"🔴 强势 TOP3（5/5）";
-
-}
-
-
-renderCards(
-"top3",
-data.top3 || []
-);
-
-
-renderCards(
-"near",
-data.near || []
-);
-
-
-renderCards(
-"watch",
-data.watch || []
-);
-
-
-const rows =
-data.ranking || [];
-
-const tbody =
-document.getElementById(
-"ranking"
-);
-
-
-if(!rows.length){
-
-tbody.innerHTML =
-`
-<tr>
-
-<td colspan="8">
-
-暂无3/5以上股票
-
-</td>
-
-</tr>
-`;
-
-}else{
-
-tbody.innerHTML =
-rows.map(
-s => {
-
-let cls =
-"pool3";
-
-if(s.hard === 5){
-
-cls =
-"pool5";
-
-}else if(
-s.hard === 4
-){
-
-cls =
-"pool4";
-
-}
-
-
-return `
-
-<tr>
-
-<td class="${cls}">
-
-${esc(s.pool)}
-
-</td>
-
-<td>
-
-${esc(s.rank)}
-
-</td>
-
-<td>
-
-${esc(s.name)}
-
-<br>
-
-<span
-style="color:#777">
-
-${esc(s.code)}
-
-</span>
-
-</td>
-
-<td>
-
-${esc(
-s.hard_text
-)}
-
-</td>
-
-<td>
-
-${esc(
-s.score
-)}
-
-</td>
-
-<td>
-
-${esc(
-s.pct
-)}%
-
-</td>
-
-<td>
-
-${esc(
-s.turnover
-)}%
-
-</td>
-
-<td>
-
-${esc(
-s.missing_text
-)}
-
-</td>
-
-</tr>
-
-`;
-
-}
-).join("");
-
-}
-
-
-}catch(e){
-
-document.getElementById(
-"error"
-).innerHTML =
-
-`
-<div class="notice">
-
-数据接口错误：
-
-${esc(e.message)}
-
-</div>
-`;
-
-}finally{
-
-document.getElementById(
-"loading"
-).style.display =
-"none";
-
-}
-
-}
-
-</script>
-
-</body>
-
-</html>
-"""
-
-
-# =========================================================
-# 首页
-# =========================================================
-
-@app.get(
-    "/",
-    response_class=HTMLResponse
-)
-def home():
-
-    return HTML
+        if all(checks.values()):
+            passed[name] = bars
+            print(f"  ✓ {name}: 全部条件通过")
+        # 可打开调试查看未通过原因
+        # else:
+        #     failed = [k for k, v in checks.items() if not v]
+        #     print(f"  ✗ {name}: 未过 {failed}")
+
+    if not passed:
+        print("\n无股票通过全部五条选股条件，请放宽阈值或补充候选池。")
+        return
+
+    # 第二步: 多因子打分
+    print(f"\n[步骤2] 多因子打分(权重: {FACTOR_WEIGHTS}):")
+    scores: List[StockScore] = []
+    for name, bars in passed.items():
+        sc = score_stock(name, bars)
+        scores.append(sc)
+
+    # 第三步: 排序取 TOP N
+    scores.sort(key=lambda s: s.total, reverse=True)
+    top = scores[: args.top]
+    print(f"\n[步骤3] 排序结果 — TOP {args.top}:")
+
+    # 第四步: 买卖点
+    plans = {sc.name: analyze_trade(sc.name, passed[sc.name]) for sc in top}
+
+    for rank, sc in enumerate(top, 1):
+        p = plans[sc.name]
+        print("-" * 66)
+        print(f"  #{rank} {sc.name}  —  {sc.total:.2f} 分")
+        for k, v in sc.factors.items():
+            print(f"      因子[{k}] {v} 分 (权重 {FACTOR_WEIGHTS[k]})")
+        print(f"      [买点] {p.buy_point}")
+        print(f"      [持有] {p.hold_rule}")
+        print(f"      [卖点] {p.sell_point}")
+        print(f"      [触发规则] {'; '.join(p.triggered_rules) if p.triggered_rules else '无'}")
+
+    if args.show_all:
+        print("\n" + "=" * 66)
+        print("全部通过条件股票的明细打分:")
+        for sc in scores:
+            print(f"  {sc.name}: {sc.total:.2f} 分")
+
+    print("\n" + "=" * 66)
+    print("免责声明: 本脚本仅为方法论实现与复盘工具，不构成任何投资建议。")
+    print("股市有风险，所有交易决策与盈亏由使用者自行承担。")
+    print("=" * 66)
+
+
+if __name__ == "__main__":
+    main()
