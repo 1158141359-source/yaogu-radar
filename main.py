@@ -6,34 +6,30 @@ from fastapi import FastAPI
 from fastapi.responses import HTMLResponse
 import uvicorn
 
+
 # ============================================================
 # 基础配置
 # ============================================================
 
 app = FastAPI(title="视频量价选股器")
 
-# 东方财富妙想智能选股接口
-MX_API_URL = "https://mkapi2.dfcfs.com/finskillshub/api/claw/stock-screen"
+MX_API_URL = (
+    "https://mkapi2.dfcfs.com/"
+    "finskillshub/api/claw/stock-screen"
+)
 
 
 # ============================================================
-# API KEY
+# 东方财富妙想 API KEY
 # ============================================================
 
 def get_api_key():
-    """
-    从环境变量读取东方财富妙想 API Key。
-
-    Render 部署时：
-    Key = MX_APIKEY
-    Value = 你的东方财富妙想 API Key
-    """
 
     key = os.getenv("MX_APIKEY")
 
     if not key:
         raise RuntimeError(
-            "未检测到 MX_APIKEY，请在服务器环境变量中设置东方财富妙想 API Key。"
+            "未检测到 MX_APIKEY，请在服务器环境变量中设置。"
         )
 
     return key
@@ -43,24 +39,24 @@ def get_api_key():
 # 调用东方财富妙想
 # ============================================================
 
-def mx_select(query: str):
-
-    api_key = get_api_key()
+def mx_select(query):
 
     headers = {
         "Content-Type": "application/json",
-        "apikey": api_key
+        "apikey": get_api_key(),
     }
 
     payload = {
-        "keyword": query
+        "keyword": query,
+        "pageNo": 1,
+        "pageSize": 100,
     }
 
     response = requests.post(
         MX_API_URL,
         headers=headers,
         json=payload,
-        timeout=60
+        timeout=60,
     )
 
     response.raise_for_status()
@@ -69,59 +65,74 @@ def mx_select(query: str):
 
 
 # ============================================================
-# 解析东方财富返回数据
+# 解析妙想返回数据
 # ============================================================
 
 def parse_result(result):
 
     if not isinstance(result, dict):
+
         return {
             "success": False,
             "message": "东方财富接口返回格式异常",
-            "data": []
+            "data": [],
         }
 
     if result.get("status") != 0:
 
         return {
             "success": False,
-            "message": result.get("message") or "东方财富接口返回异常",
-            "data": []
+            "message": (
+                result.get("message")
+                or "东方财富接口返回异常"
+            ),
+            "data": [],
         }
 
-    data = result.get("data", {})
+    data = result.get("data") or {}
 
     if not isinstance(data, dict):
         data = {}
 
-    inner = data.get("data", {})
+    inner = data.get("data") or {}
 
     if not isinstance(inner, dict):
         inner = {}
 
-    all_results = inner.get("allResults", {})
+    # ========================================================
+    # 妙想当前返回结构
+    #
+    # data
+    #   └── data
+    #        └── result
+    #             ├── columns
+    #             └── dataList
+    # ========================================================
 
-    if not isinstance(all_results, dict):
-        all_results = {}
-
-    result_data = all_results.get("result", {})
+    result_data = inner.get("result") or {}
 
     if not isinstance(result_data, dict):
         result_data = {}
 
-    data_list = result_data.get("dataList", [])
+    data_list = (
+        result_data.get("dataList")
+        or []
+    )
+
+    columns = (
+        result_data.get("columns")
+        or []
+    )
 
     if not isinstance(data_list, list):
         data_list = []
 
-    columns = result_data.get("columns", [])
-
     if not isinstance(columns, list):
         columns = []
 
-    # --------------------------------------------------------
-    # 建立字段中文名称映射
-    # --------------------------------------------------------
+    # ========================================================
+    # 建立字段中文名称
+    # ========================================================
 
     column_map = {}
 
@@ -146,9 +157,9 @@ def parse_result(result):
         if key:
             column_map[str(key)] = str(title)
 
-    # --------------------------------------------------------
-    # 解析股票
-    # --------------------------------------------------------
+    # ========================================================
+    # 股票数据
+    # ========================================================
 
     stocks = []
 
@@ -175,167 +186,140 @@ def parse_result(result):
             row.get("NEWEST_PRICE")
             or row.get("最新价")
             or row.get("现价")
-            or 0
+            or ""
         )
 
         pct = (
             row.get("CHG")
             or row.get("涨跌幅")
             or row.get("涨幅")
-            or 0
+            or ""
         )
 
         extra = {}
 
         for key, value in row.items():
 
-            cn_name = column_map.get(
+            display_name = column_map.get(
                 str(key),
                 str(key)
             )
 
-            extra[cn_name] = value
+            extra[display_name] = value
 
-        stocks.append({
-            "code": str(code),
-            "name": str(name),
-            "price": price,
-            "pct": pct,
-            "extra": extra
-        })
-
-    # --------------------------------------------------------
-    # 如果没有结构化结果，保留部分结果
-    # --------------------------------------------------------
-
-    if not stocks:
-
-        partial = inner.get(
-            "partialResults",
-            ""
-        )
-
-        if partial:
-
-            return {
-                "success": True,
-                "message": "东方财富返回了部分结果",
-                "data": [],
-                "partial": partial
+        stocks.append(
+            {
+                "code": str(code),
+                "name": str(name),
+                "price": price,
+                "pct": pct,
+                "extra": extra,
             }
+        )
 
     return {
         "success": True,
         "message": "ok",
         "data": stocks,
         "total": len(stocks),
-        "parserText": inner.get(
-            "parserText",
-            ""
-        ),
-        "condition": inner.get(
-            "totalCondition",
-            {}
-        )
     }
 
 
 # ============================================================
-# 视频里的量价选股逻辑
+# 视频量价评分策略
 # ============================================================
 
 VIDEO_QUERY = r"""
-请按照以下“视频量价交易方法”筛选今天A股股票。
 
-注意：
+请筛选今天A股。
 
-不要使用以前的“妖股雷达”规则。
+严格按照下面的“视频量价结构评分法”。
 
-不要使用：
-龙虎榜硬条件、
-连板硬条件、
-市值300亿硬条件、
-竞价换手率29.25%硬条件、
-竞价涨幅5%硬条件、
-委卖大于委买硬条件。
+特别注意：
 
-本次只按照视频中的“缩量筑底 → 地量 → 止跌 → 温和放量 → 突破”的量价结构选股。
+【不要求全部条件同时满足】
 
-==================================================
-第一阶段：前期上涨 / 冲高
-==================================================
+5个条件是独立评分。
 
-股票之前应该经历过一段明显上涨，
-或者出现过阶段性冲高。
+每项20分。
 
-随后出现较明显的回撤或调整。
+总分100分。
 
-重点寻找：
+只要满足至少3项，也就是50分以上，
+就可以进入候选。
 
-前期有上涨空间
-+
-随后出现明显回调
-+
-目前处于调整末端或者底部区域。
+============================================================
+第一项：缩量回调
+20分
+============================================================
 
-==================================================
-第二阶段：成交量持续缩小
-==================================================
+股票之前应该经历过：
 
-调整过程中：
+明显上涨
+或者
+阶段性冲高。
 
-股价回落，
-成交量同步持续缩小。
+之后出现回调。
 
-优先寻找：
+回调过程中：
 
-缩量回调
-+
-成交量逐渐降低
-+
-抛压逐渐减弱。
+成交量总体下降，
+成交量明显小于前期上涨阶段。
 
-==================================================
-第三阶段：出现阶段性地量
-==================================================
+满足：
+前期上涨 + 缩量回调
 
-重点寻找明显的阶段性地量。
+得20分。
 
-要求：
+============================================================
+第二项：阶段性地量
+20分
+============================================================
 
-近期成交量明显低于此前上涨阶段；
-成交量逐渐接近阶段低位；
-出现比较明显的缩量区域。
+寻找近期明显的阶段性低成交量。
 
-“地量”不能单独作为买入信号。
+重点观察：
 
-==================================================
-第四阶段：地量之后止跌
-==================================================
+近期成交量明显低于此前活跃阶段；
+成交量进入阶段低位；
+成交量出现明显收缩。
+
+出现明显地量：
+
+得20分。
+
+============================================================
+第三项：地量之后止跌
+20分
+============================================================
 
 地量出现以后：
 
-股价不再持续创新低，
-或者低点基本保持稳定。
+股价不再持续创新低。
 
 重点寻找：
 
-地量
-+
-止跌
-+
-低点不再明显下移。
+低点趋稳；
+连续下跌结束；
+出现止跌；
+或者开始形成小平台。
 
-说明卖压可能逐渐衰竭。
+满足：
 
-==================================================
-第五阶段：温和放量
-==================================================
+地量 + 止跌
 
-在地量和止跌之后：
+得20分。
+
+============================================================
+第四项：温和放量
+20分
+============================================================
+
+止跌之后：
 
 出现阳线；
-成交量相比前几日开始温和增加。
+价格开始转强；
+成交量相比前几日温和增加。
 
 重点寻找：
 
@@ -345,73 +329,137 @@ VIDEO_QUERY = r"""
 +
 温和放量。
 
-不要寻找已经连续暴涨很多天的股票。
+满足：
 
-==================================================
-第六阶段：放量突破
-==================================================
+得20分。
 
-最重要的确认信号：
+============================================================
+第五项：放量突破
+20分
+============================================================
 
-后续出现明显放量；
-同时股价突破：
+如果股票已经出现：
 
-前期平台，
-或者近期重要高点，
-或者阶段压力位。
+明显放量；
 
-重点寻找：
+并且突破：
 
-放量
-+
-突破平台
-+
-突破近期高点。
+近期平台；
+前期高点；
+阶段压力位；
+近期重要高点；
 
-==================================================
-综合排序
-==================================================
+则得20分。
 
-请根据上述量价结构进行综合评分。
+============================================================
+评分规则
+============================================================
 
-优先级：
+缩量回调       20分
+地量           20分
+止跌           20分
+温和放量       20分
+放量突破       20分
 
-1. 已经完成缩量筑底、地量、止跌，并出现温和放量；
-2. 已经开始放量突破前期平台；
-3. 正在接近突破确认；
-4. 量价结构完整；
-5. 前期上涨明显；
-6. 回调充分；
-7. 成交量缩减明显；
-8. 地量明显；
-9. 止跌明显；
-10. 突破时成交量明显增加。
+总分：
 
-特别注意：
+0-100分。
 
-“地量”本身不是买入信号。
+注意：
 
-必须结合：
+【不要求全部满足】
 
-缩量筑底
-+
-地量
-+
-止跌
-+
-温和放量
-+
-突破
+50分：
+进入候选。
 
-进行综合判断。
+60分：
+较强候选。
 
-==================================================
-输出要求
-==================================================
+70分：
+重点关注。
 
-请返回尽可能完整的候选股票列表。
+80分以上：
+强势候选。
 
-每只股票尽量提供：
+100分：
+量价结构完整。
+
+============================================================
+非常重要
+============================================================
+
+不要因为缺少某一个条件而淘汰股票。
+
+例如：
+
+股票A：
+
+缩量回调 ✓
+地量 ✓
+止跌 ✓
+温和放量 ✗
+突破 ✗
+
+仍然应该：
+
+60分
+进入候选。
+
+股票B：
+
+缩量回调 ✓
+地量 ✓
+止跌 ✓
+温和放量 ✓
+突破 ✗
+
+应该：
+
+80分
+重点关注。
+
+股票C：
+
+缩量回调 ✓
+地量 ✓
+止跌 ✓
+温和放量 ✓
+突破 ✓
+
+应该：
+
+100分
+最高级候选。
+
+============================================================
+排序
+============================================================
+
+按照：
+
+第一：
+视频量价结构总分
+
+第二：
+是否出现温和放量
+
+第三：
+是否已经突破
+
+第四：
+近期量价转强程度
+
+从高到低排序。
+
+============================================================
+输出
+============================================================
+
+请尽可能返回：
+
+20-50只候选股票。
+
+每只尽量提供：
 
 股票代码
 股票简称
@@ -422,29 +470,42 @@ VIDEO_QUERY = r"""
 换手率
 近期高点
 近期低点
-量价变化
-以及能够证明其符合：
 
-缩量
+以及：
+
+缩量回调
 地量
 止跌
 温和放量
-突破
+放量突破
 
-的相关指标。
+分别是否满足。
 
-最后按照：
+并给出：
 
-“视频量价结构匹配程度”
+视频量价结构评分：
 
-从高到低排序。
+0-100分。
 
-重点标记最强的TOP 3股票。
+============================================================
+禁止使用旧策略
+============================================================
 
-不要把单纯下跌后的股票直接判定为强势股。
+不要使用：
 
-必须优先考虑已经出现量价转强迹象，
-或者正在接近突破确认的股票。
+龙虎榜硬条件；
+连板硬条件；
+市值300亿硬条件；
+竞价换手率29.25%硬条件；
+竞价涨幅5%硬条件；
+委卖大于委买硬条件。
+
+这些全部取消。
+
+本次只使用：
+
+【视频量价结构评分法】。
+
 """
 
 
@@ -454,16 +515,96 @@ VIDEO_QUERY = r"""
 
 def scan():
 
-    result = mx_select(VIDEO_QUERY)
+    try:
 
-    return parse_result(result)
+        result = parse_result(
+            mx_select(VIDEO_QUERY)
+        )
+
+        if result.get("data"):
+
+            return result
+
+        # ====================================================
+        # 第一轮没有结果时，自动放宽
+        # ====================================================
+
+        fallback_query = r"""
+
+筛选今天A股。
+
+按照视频量价结构寻找候选。
+
+不要要求所有条件同时满足。
+
+以下5项：
+
+1. 缩量回调
+2. 地量
+3. 止跌
+4. 温和放量
+5. 放量突破
+
+只要至少满足3项，
+即可进入候选。
+
+按照量价结构完整程度排序。
+
+重点寻找：
+
+前期上涨；
+缩量回调；
+成交量萎缩；
+阶段性地量；
+低点稳定；
+止跌；
+温和放量；
+平台突破。
+
+不要使用：
+
+龙虎榜；
+连板；
+市值300亿；
+竞价换手率29.25%；
+竞价涨幅5%；
+委卖大于委买。
+
+返回尽可能多的候选股票。
+
+提供：
+
+代码；
+简称；
+最新价；
+涨跌幅；
+成交量；
+成交额；
+换手率；
+近期高低点；
+量价指标。
+
+"""
+
+        return parse_result(
+            mx_select(fallback_query)
+        )
+
+    except Exception as e:
+
+        return {
+            "success": False,
+            "message": str(e),
+            "data": [],
+        }
 
 
 # ============================================================
-# HTML 页面
+# 手机端网页
 # ============================================================
 
 HTML = r"""
+
 <!DOCTYPE html>
 
 <html lang="zh-CN">
@@ -474,16 +615,24 @@ HTML = r"""
 
 <meta
     name="viewport"
-    content="width=device-width,initial-scale=1.0,maximum-scale=1.0,user-scalable=no"
+    content="width=device-width,
+    initial-scale=1,
+    maximum-scale=1,
+    user-scalable=no"
 >
 
-<title>视频量价选股器</title>
+<title>
+视频量价选股器
+</title>
+
 
 <style>
+
 
 * {
     box-sizing: border-box;
 }
+
 
 body {
 
@@ -492,12 +641,12 @@ body {
     background:
         radial-gradient(
             circle at top,
-            #18202b 0%,
+            #17202b 0%,
             #080b10 45%,
             #050608 100%
         );
 
-    color: #f2f4f7;
+    color: #f1f4f7;
 
     font-family:
         -apple-system,
@@ -506,8 +655,8 @@ body {
         "Microsoft YaHei",
         sans-serif;
 
-    min-height: 100vh;
 }
+
 
 .header {
 
@@ -517,45 +666,57 @@ body {
 
     z-index: 10;
 
-    padding: 16px;
+    padding: 17px 16px;
 
-    background: rgba(5,8,12,0.94);
+    background:
+        rgba(
+            5,
+            8,
+            12,
+            0.96
+        );
 
-    backdrop-filter: blur(12px);
+    backdrop-filter:
+        blur(12px);
 
-    border-bottom: 1px solid #202733;
+    border-bottom:
+        1px solid #202733;
+
 }
+
 
 .title {
 
-    font-size: 22px;
+    font-size: 21px;
 
-    font-weight: 800;
+    font-weight: 900;
 
-    letter-spacing: 1px;
 }
+
 
 .subtitle {
 
-    margin-top: 6px;
+    margin-top: 5px;
 
     color: #8d98a8;
 
     font-size: 12px;
+
 }
 
-.container {
 
-    width: 100%;
+.container {
 
     max-width: 1000px;
 
     margin: auto;
 
     padding: 14px;
+
 }
 
-.method {
+
+.steps {
 
     display: flex;
 
@@ -563,308 +724,431 @@ body {
 
     overflow-x: auto;
 
-    padding-bottom: 12px;
+    margin-bottom: 12px;
+
 }
+
 
 .step {
 
-    flex: 0 0 auto;
+    flex:
+        0 0 auto;
 
-    padding: 8px 11px;
+    white-space:
+        nowrap;
 
-    border-radius: 8px;
+    padding:
+        8px 10px;
 
-    background: #111722;
+    border-radius:
+        8px;
 
-    border: 1px solid #222b37;
+    border:
+        1px solid #5e1825;
 
-    color: #aeb8c6;
+    background:
+        #281019;
 
-    font-size: 12px;
+    color:
+        #e3a7b0;
+
+    font-size:
+        12px;
+
 }
 
-.step.active {
-
-    color: #fff;
-
-    border-color: #8b1e2d;
-
-    background: #321019;
-}
 
 .toolbar {
 
     display: flex;
 
-    gap: 10px;
+    gap: 9px;
 
-    margin-bottom: 15px;
+    margin-bottom: 16px;
+
 }
+
 
 button {
 
     border: none;
 
-    border-radius: 9px;
+    border-radius: 10px;
 
-    padding: 11px 17px;
+    padding:
+        12px 18px;
 
-    font-size: 14px;
-
-    font-weight: 700;
+    background:
+        #c32036;
 
     color: white;
 
-    background: #b82031;
+    font-weight: 800;
 
-    cursor: pointer;
+    font-size: 15px;
+
 }
 
-button:active {
-
-    transform: scale(0.97);
-}
 
 .status {
 
     flex: 1;
 
-    display: flex;
+    border:
+        1px solid #202733;
 
-    align-items: center;
+    background:
+        #10151d;
 
-    justify-content: center;
+    border-radius:
+        10px;
 
-    color: #8f9aaa;
+    display:
+        flex;
 
-    font-size: 12px;
+    align-items:
+        center;
 
-    background: #10151d;
+    justify-content:
+        center;
 
-    border-radius: 9px;
+    color:
+        #929dac;
 
-    border: 1px solid #202733;
+    font-size:
+        12px;
+
 }
 
-.section-title {
 
-    margin: 18px 0 10px;
+h2 {
 
-    font-size: 17px;
+    font-size:
+        18px;
 
-    font-weight: 800;
+    margin:
+        18px 0 10px;
+
 }
+
 
 .top3 {
 
-    display: grid;
+    display:
+        grid;
 
     grid-template-columns:
         repeat(3, 1fr);
 
-    gap: 10px;
+    gap:
+        10px;
+
 }
 
+
 .card {
-
-    padding: 14px;
-
-    border-radius: 13px;
 
     background:
         linear-gradient(
             145deg,
-            #171c25,
-            #0c0f14
+            #171d27,
+            #0d1117
         );
 
-    border: 1px solid #2a313c;
+    border:
+        1px solid #2b3440;
 
-    box-shadow:
-        0 8px 30px rgba(0,0,0,0.25);
+    border-radius:
+        13px;
+
+    padding:
+        14px;
+
 }
+
 
 .rank {
 
-    font-size: 12px;
+    font-size:
+        12px;
 
-    color: #d35a68;
+    color:
+        #ff5265;
 
-    font-weight: 800;
+    font-weight:
+        900;
+
 }
+
 
 .name {
 
-    margin-top: 6px;
+    font-size:
+        19px;
 
-    font-size: 19px;
+    font-weight:
+        900;
 
-    font-weight: 900;
+    margin-top:
+        5px;
+
 }
+
 
 .code {
 
-    margin-top: 3px;
+    font-size:
+        11px;
 
-    color: #737f8e;
+    color:
+        #768293;
 
-    font-size: 11px;
+    margin-top:
+        3px;
+
 }
+
+
+.score {
+
+    font-size:
+        28px;
+
+    font-weight:
+        900;
+
+    margin-top:
+        10px;
+
+    color:
+        #ff6372;
+
+}
+
+
+.score small {
+
+    font-size:
+        12px;
+
+    color:
+        #8994a3;
+
+}
+
 
 .price {
 
-    margin-top: 12px;
+    font-size:
+        18px;
 
-    font-size: 23px;
+    font-weight:
+        800;
 
-    font-weight: 900;
+    margin-top:
+        8px;
+
 }
+
 
 .pct {
 
-    margin-top: 3px;
+    font-size:
+        13px;
 
-    font-size: 13px;
+    margin-top:
+        2px;
 
-    font-weight: 800;
 }
+
 
 .up {
 
-    color: #ff4d5e;
+    color:
+        #ff5265;
+
 }
+
 
 .down {
 
-    color: #25c47a;
+    color:
+        #28c982;
+
 }
+
 
 .tags {
 
-    display: flex;
+    display:
+        flex;
 
-    flex-wrap: wrap;
+    flex-wrap:
+        wrap;
 
-    gap: 5px;
+    gap:
+        5px;
 
-    margin-top: 12px;
+    margin-top:
+        10px;
+
 }
+
 
 .tag {
 
-    padding: 4px 7px;
+    font-size:
+        10px;
 
-    border-radius: 5px;
+    padding:
+        4px 6px;
 
-    background: #202733;
+    border-radius:
+        5px;
 
-    color: #b7c1cd;
+    background:
+        #202832;
 
-    font-size: 10px;
+    color:
+        #c1cad4;
+
 }
+
 
 .empty {
 
-    padding: 30px 15px;
+    padding:
+        28px;
 
-    text-align: center;
+    text-align:
+        center;
 
-    color: #727e8e;
+    color:
+        #727e8d;
 
-    background: #0d1117;
+    border:
+        1px dashed #29313d;
 
-    border-radius: 12px;
+    border-radius:
+        12px;
 
-    border: 1px dashed #29313d;
 }
+
 
 .table-wrap {
 
-    overflow-x: auto;
+    overflow-x:
+        auto;
 
-    border-radius: 12px;
+    border:
+        1px solid #202733;
 
-    border: 1px solid #202733;
+    border-radius:
+        12px;
 
-    background: #0b0e13;
+    background:
+        #0b0e13;
+
 }
+
 
 table {
 
-    width: 100%;
+    width:
+        100%;
 
-    min-width: 650px;
+    min-width:
+        820px;
 
-    border-collapse: collapse;
+    border-collapse:
+        collapse;
 
-    font-size: 12px;
+    font-size:
+        12px;
+
 }
+
 
 th {
 
-    text-align: left;
+    background:
+        #121720;
 
-    color: #8d98a8;
+    color:
+        #8e99a8;
 
-    background: #121720;
+    text-align:
+        left;
 
-    padding: 10px;
+    padding:
+        10px;
 
-    white-space: nowrap;
+    white-space:
+        nowrap;
+
 }
+
 
 td {
 
-    padding: 10px;
+    padding:
+        10px;
 
-    border-top: 1px solid #1b222c;
+    border-top:
+        1px solid #1b222c;
 
-    white-space: nowrap;
+    white-space:
+        nowrap;
+
 }
+
+
+.scorebar {
+
+    font-weight:
+        900;
+
+    color:
+        #ff6372;
+
+}
+
 
 .footer {
 
-    margin: 20px 0 30px;
+    text-align:
+        center;
 
-    color: #606b79;
+    color:
+        #606b79;
 
-    text-align: center;
+    font-size:
+        11px;
 
-    font-size: 11px;
-}
-
-.loading {
-
-    animation:
-        pulse 1s infinite;
-}
-
-@keyframes pulse {
-
-    50% {
-        opacity: 0.45;
-    }
+    padding:
+        20px 0 35px;
 
 }
+
 
 @media(max-width:650px) {
 
     .top3 {
 
-        grid-template-columns: 1fr;
-    }
+        grid-template-columns:
+            1fr;
 
-    .card {
-
-        padding: 13px;
     }
 
     .title {
 
-        font-size: 20px;
+        font-size:
+            20px;
+
     }
 
 }
+
 
 </style>
 
@@ -877,11 +1161,17 @@ td {
 <div class="header">
 
     <div class="title">
+
         📈 视频量价选股器
+
     </div>
 
     <div class="subtitle">
-        缩量筑底 → 地量 → 止跌 → 温和放量 → 突破
+
+        缩量回调 → 地量 → 止跌 → 温和放量 → 突破
+
+        ｜评分制，不要求全部满足
+
     </div>
 
 </div>
@@ -890,120 +1180,152 @@ td {
 <div class="container">
 
 
-    <div class="method">
+<div class="steps">
 
-        <div class="step active">
-            ① 缩量筑底
-        </div>
-
-        <div class="step active">
-            ② 地量
-        </div>
-
-        <div class="step active">
-            ③ 止跌
-        </div>
-
-        <div class="step active">
-            ④ 温和放量
-        </div>
-
-        <div class="step active">
-            ⑤ 放量突破
-        </div>
-
+    <div class="step">
+        ① 缩量回调 20
     </div>
 
-
-    <div class="toolbar">
-
-        <button onclick="scan()">
-            🔍 开始选股
-        </button>
-
-        <div
-            id="status"
-            class="status"
-        >
-            等待扫描
-        </div>
-
+    <div class="step">
+        ② 地量 20
     </div>
 
-
-    <div class="section-title">
-        🔥 视频量价匹配 TOP 3
+    <div class="step">
+        ③ 止跌 20
     </div>
 
+    <div class="step">
+        ④ 温和放量 20
+    </div>
+
+    <div class="step">
+        ⑤ 放量突破 20
+    </div>
+
+</div>
+
+
+<div class="toolbar">
+
+    <button onclick="scan()">
+
+        🔍 开始选股
+
+    </button>
 
     <div
-        id="top3"
-        class="top3"
+        id="status"
+        class="status"
     >
 
-        <div class="empty">
-            点击“开始选股”
-        </div>
+        等待扫描
 
     </div>
 
-
-    <div class="section-title">
-        📊 全部候选
-    </div>
+</div>
 
 
-    <div class="table-wrap">
+<h2>
 
-        <table>
+    🔥 视频量价匹配 TOP 3
 
-            <thead>
+</h2>
 
-                <tr>
 
-                    <th>排名</th>
+<div
+    id="top3"
+    class="top3"
+>
 
-                    <th>代码</th>
+    <div class="empty">
 
-                    <th>名称</th>
-
-                    <th>最新价</th>
-
-                    <th>涨跌幅</th>
-
-                    <th>量价指标</th>
-
-                </tr>
-
-            </thead>
-
-            <tbody id="table">
-
-                <tr>
-
-                    <td colspan="6">
-
-                        <div class="empty">
-                            暂无数据
-                        </div>
-
-                    </td>
-
-                </tr>
-
-            </tbody>
-
-        </table>
+        点击“开始选股”
 
     </div>
 
+</div>
 
-    <div class="footer">
 
-        数据由东方财富妙想接口提供<br>
-        本工具仅用于量价结构分析，不构成投资建议
+<h2>
+
+    📊 全部候选
+
+</h2>
+
+
+<div class="table-wrap">
+
+<table>
+
+<thead>
+
+<tr>
+
+    <th>
+        排名
+    </th>
+
+    <th>
+        代码
+    </th>
+
+    <th>
+        名称
+    </th>
+
+    <th>
+        评分
+    </th>
+
+    <th>
+        最新价
+    </th>
+
+    <th>
+        涨跌幅
+    </th>
+
+    <th>
+        量价指标
+    </th>
+
+</tr>
+
+</thead>
+
+
+<tbody id="table">
+
+<tr>
+
+<td colspan="7">
+
+    <div class="empty">
+
+        暂无数据
 
     </div>
+
+</td>
+
+</tr>
+
+</tbody>
+
+</table>
+
+</div>
+
+
+<div class="footer">
+
+    数据由东方财富妙想接口提供
+
+    <br>
+
+    本工具仅用于量价结构分析，不构成投资建议
+
+</div>
 
 
 </div>
@@ -1012,53 +1334,174 @@ td {
 <script>
 
 
-function safeText(value) {
+function safe(v) {
 
     if (
-        value === null ||
-        value === undefined
+        v === null ||
+        v === undefined
     ) {
 
         return "";
 
     }
 
-    return String(value);
+    return String(v);
 
 }
 
 
-function formatPct(value) {
+/* =========================================================
+   提取评分
+========================================================= */
 
-    if (
-        value === null ||
-        value === undefined ||
-        value === ""
+function getScore(stock) {
+
+    const extra =
+        stock.extra || {};
+
+    for (
+        const key of Object.keys(extra)
     ) {
 
-        return "--";
+        if (
+            /评分|分数|量价结构|匹配度/
+            .test(key)
+        ) {
+
+            const number =
+                parseFloat(
+                    String(extra[key])
+                    .replace(
+                        /[^\d.-]/g,
+                        ""
+                    )
+                );
+
+            if (
+                !isNaN(number)
+            ) {
+
+                return Math.max(
+                    0,
+                    Math.min(
+                        100,
+                        number
+                    )
+                );
+
+            }
+
+        }
 
     }
 
-    return safeText(value);
+    return null;
 
 }
 
+
+/* =========================================================
+   判断量价标签
+========================================================= */
+
+function getTags(stock) {
+
+    const extra =
+        stock.extra || {};
+
+    const text =
+        Object.entries(extra)
+        .map(
+            ([key,value]) =>
+                key + ":" + value
+        )
+        .join(" ");
+
+    const tags = [];
+
+
+    if (
+        /缩量/
+        .test(text)
+    ) {
+
+        tags.push("缩量");
+
+    }
+
+
+    if (
+        /地量/
+        .test(text)
+    ) {
+
+        tags.push("地量");
+
+    }
+
+
+    if (
+        /止跌/
+        .test(text)
+    ) {
+
+        tags.push("止跌");
+
+    }
+
+
+    if (
+        /温和放量|放量/
+        .test(text)
+    ) {
+
+        tags.push("放量");
+
+    }
+
+
+    if (
+        /突破/
+        .test(text)
+    ) {
+
+        tags.push("突破");
+
+    }
+
+
+    return tags.slice(
+        0,
+        5
+    );
+
+}
+
+
+/* =========================================================
+   TOP 3
+========================================================= */
 
 function renderTop3(list) {
 
     const box =
-        document.getElementById("top3");
+        document.getElementById(
+            "top3"
+        );
+
 
     if (
-        !list ||
-        list.length === 0
+        !list.length
     ) {
 
         box.innerHTML = `
+
             <div class="empty">
-                当前没有返回候选股票
+
+                当前没有候选股票
+
             </div>
+
         `;
 
         return;
@@ -1066,107 +1509,177 @@ function renderTop3(list) {
     }
 
 
-    const top =
-        list.slice(0,3);
-
-
     box.innerHTML =
-        top.map((item,index) => {
 
-            const pct =
-                safeText(item.pct);
+        list
+        .slice(0,3)
+        .map(
+            (stock,index) => {
 
-            const numericPct =
-                parseFloat(
-                    String(pct)
-                        .replace("%","")
-                );
+                const pct =
+                    parseFloat(
+                        String(
+                            stock.pct
+                        )
+                        .replace(
+                            "%",
+                            ""
+                        )
+                    );
 
-            const cls =
-                numericPct >= 0
-                ? "up"
-                : "down";
+
+                const score =
+                    getScore(
+                        stock
+                    );
 
 
-            return `
+                const tags =
+                    getTags(
+                        stock
+                    );
 
-                <div class="card">
 
-                    <div class="rank">
-                        TOP ${index + 1}
-                    </div>
+                return `
 
-                    <div class="name">
-                        ${safeText(item.name) || "--"}
-                    </div>
+<div class="card">
 
-                    <div class="code">
-                        ${safeText(item.code) || "--"}
-                    </div>
+    <div class="rank">
 
-                    <div class="price">
-                        ${safeText(item.price) || "--"}
-                    </div>
+        TOP ${index + 1}
 
-                    <div class="pct ${cls}">
-                        ${pct || "--"}
-                    </div>
+    </div>
 
-                    <div class="tags">
 
-                        <span class="tag">
-                            缩量筑底
-                        </span>
+    <div class="name">
 
-                        <span class="tag">
-                            地量
-                        </span>
+        ${safe(
+            stock.name
+        ) || "--"}
 
-                        <span class="tag">
-                            止跌
-                        </span>
+    </div>
 
-                        <span class="tag">
-                            放量确认
-                        </span>
 
-                    </div>
+    <div class="code">
 
-                </div>
+        ${safe(
+            stock.code
+        ) || "--"}
 
-            `;
+    </div>
 
-        }).join("");
+
+    <div class="score">
+
+        ${
+            score === null
+            ? "—"
+            : score
+        }
+
+        <small>
+
+            ${
+                score === null
+                ? ""
+                : " / 100"
+            }
+
+        </small>
+
+    </div>
+
+
+    <div class="price">
+
+        ${
+            safe(
+                stock.price
+            ) || "--"
+        }
+
+    </div>
+
+
+    <div
+        class="pct ${
+            isNaN(pct) ||
+            pct >= 0
+            ? "up"
+            : "down"
+        }"
+    >
+
+        ${
+            safe(
+                stock.pct
+            ) || "--"
+        }
+
+    </div>
+
+
+    <div class="tags">
+
+        ${
+            tags
+            .map(
+                tag => `
+                <span class="tag">
+                    ${tag} ✓
+                </span>
+                `
+            )
+            .join("")
+        }
+
+    </div>
+
+
+</div>
+
+`;
+
+            }
+        )
+        .join("");
 
 }
 
 
+/* =========================================================
+   全部股票
+========================================================= */
+
 function renderTable(list) {
 
     const table =
-        document.getElementById("table");
+        document.getElementById(
+            "table"
+        );
 
 
     if (
-        !list ||
-        list.length === 0
+        !list.length
     ) {
 
         table.innerHTML = `
 
-            <tr>
+<tr>
 
-                <td colspan="6">
+<td colspan="7">
 
-                    <div class="empty">
-                        暂无符合结果
-                    </div>
+    <div class="empty">
 
-                </td>
+        暂无符合结果
 
-            </tr>
+    </div>
 
-        `;
+</td>
+
+</tr>
+
+`;
 
         return;
 
@@ -1175,69 +1688,98 @@ function renderTable(list) {
 
     table.innerHTML =
 
-        list.map((item,index) => {
+        list
+        .map(
+            (stock,index) => {
 
-            const pct =
-                safeText(item.pct);
+                const score =
+                    getScore(
+                        stock
+                    );
 
 
-            return `
-
-                <tr>
-
-                    <td>
-                        ${index + 1}
-                    </td>
-
-                    <td>
-                        ${safeText(item.code)}
-                    </td>
-
-                    <td>
-                        <b>
-                            ${safeText(item.name)}
-                        </b>
-                    </td>
-
-                    <td>
-                        ${safeText(item.price)}
-                    </td>
-
-                    <td>
-                        ${pct}
-                    </td>
-
-                    <td>
-
-                        ${Object.entries(
-                            item.extra || {}
-                        )
-                        .slice(0,5)
-                        .map(
-                            ([key,value]) =>
+                const extra =
+                    Object.entries(
+                        stock.extra || {}
+                    )
+                    .slice(
+                        0,
+                        8
+                    )
+                    .map(
+                        ([key,value]) =>
                             `${key}: ${value}`
-                        )
-                        .join("<br>")}
+                    )
+                    .join(
+                        "<br>"
+                    );
 
-                    </td>
 
-                </tr>
+                return `
 
-            `;
+<tr>
 
-        }).join("");
+<td>
+    ${index + 1}
+</td>
+
+<td>
+    ${safe(stock.code)}
+</td>
+
+<td>
+    <b>
+        ${safe(stock.name)}
+    </b>
+</td>
+
+<td class="scorebar">
+
+    ${
+        score === null
+        ? "—"
+        : score
+    }
+
+</td>
+
+<td>
+    ${safe(stock.price)}
+</td>
+
+<td>
+    ${safe(stock.pct)}
+</td>
+
+<td>
+    ${extra}
+</td>
+
+</tr>
+
+`;
+
+            }
+        )
+        .join("");
 
 }
 
 
+/* =========================================================
+   扫描
+========================================================= */
+
 async function scan() {
 
     const status =
-        document.getElementById("status");
+        document.getElementById(
+            "status"
+        );
 
 
-    status.innerHTML =
-        '<span class="loading">正在扫描东方财富数据...</span>';
+    status.textContent =
+        "正在扫描东方财富妙想……";
 
 
     try {
@@ -1246,7 +1788,8 @@ async function scan() {
             await fetch(
                 "/api/scan",
                 {
-                    cache: "no-store"
+                    cache:
+                        "no-store"
                 }
             );
 
@@ -1255,7 +1798,9 @@ async function scan() {
             await response.json();
 
 
-        if (!result.success) {
+        if (
+            !result.success
+        ) {
 
             throw new Error(
                 result.message ||
@@ -1265,39 +1810,61 @@ async function scan() {
         }
 
 
-        const list =
+        let list =
             result.data || [];
 
 
-        renderTop3(list);
+        /*
+         * 前端再次按评分排序
+         */
 
-        renderTable(list);
+        list.sort(
+            (a,b) =>
+                (
+                    getScore(b) || 0
+                )
+                -
+                (
+                    getScore(a) || 0
+                )
+        );
 
 
-        status.innerHTML =
+        renderTop3(
+            list
+        );
+
+
+        renderTable(
+            list
+        );
+
+
+        status.textContent =
             `完成：${list.length} 只`;
 
 
-    } catch(error) {
+    }
+    catch(error) {
 
-        console.error(error);
-
-
-        document.getElementById("top3")
+        document
+            .getElementById(
+                "top3"
+            )
             .innerHTML = `
 
                 <div class="empty">
 
-                    ❌ 扫描失败<br><br>
-
-                    ${safeText(error.message)}
+                    ❌ ${safe(
+                        error.message
+                    )}
 
                 </div>
 
             `;
 
 
-        status.innerHTML =
+        status.textContent =
             "扫描失败";
 
     }
@@ -1311,11 +1878,12 @@ async function scan() {
 </body>
 
 </html>
+
 """
 
 
 # ============================================================
-# 首页
+# 页面
 # ============================================================
 
 @app.get(
@@ -1331,27 +1899,21 @@ def home():
 # API
 # ============================================================
 
-@app.get("/api/scan")
+@app.get(
+    "/api/scan"
+)
 def api_scan():
 
-    try:
-
-        return scan()
-
-    except Exception as e:
-
-        return {
-            "success": False,
-            "message": str(e),
-            "data": []
-        }
+    return scan()
 
 
 # ============================================================
 # 健康检查
 # ============================================================
 
-@app.get("/health")
+@app.get(
+    "/health"
+)
 def health():
 
     return {
