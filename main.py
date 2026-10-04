@@ -15,6 +15,7 @@ app = FastAPI(title="妖股雷达")
 
 EM_HOSTS = [
     "https://push2ex.eastmoney.com",
+    "https://push2delay.eastmoney.com",
     "https://push2.eastmoney.com",
     "https://82.push2.eastmoney.com",
 ]
