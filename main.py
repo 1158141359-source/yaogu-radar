@@ -1,454 +1,251 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, Query
 from fastapi.responses import HTMLResponse
-import os
-import html
-import time
-import requests
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from urllib.parse import quote
+import requests
+import os
+import re
+import time
 
 app = FastAPI(title="妖股雷达")
 
+TZ = ZoneInfo("Asia/Shanghai")
+TODAY = datetime.now(TZ).date()
+
+EASTMONEY = "https://push2.eastmoney.com"
+EASTMONEY_EX = "https://push2ex.eastmoney.com"
+DATACENTER = "https://datacenter-web.eastmoney.com"
+
 MX_URL = "https://mkapi2.dfcfs.com/finskillshub/api/claw/stock-screen"
 
-HEADERS = {
-    "User-Agent": "Mozilla/5.0",
+VERSION = "v4.0-score"
+
+session = requests.Session()
+session.headers.update({
+    "User-Agent": (
+        "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
+        "AppleWebKit/605.1.15 Mobile/15E148 Safari/604.1"
+    ),
     "Referer": "https://quote.eastmoney.com/"
-}
+})
 
-CACHE = {
-    "ts": 0,
-    "data": [],
-    "source": "未连接"
-}
-
+CACHE = {}
 CACHE_SECONDS = 60
 
 
 # =========================================================
-# 妙想：只负责找候选股票
+# 基础
 # =========================================================
 
-QUERY = """
-请筛选今天A股市场最强势的股票候选，返回至少30只。
-
-重点关注：
-1. 今日涨幅较大；
-2. 今日换手率较高；
-3. 最近出现涨停；
-4. 最近出现龙虎榜；
-5. 市值300亿元以内；
-6. 排除ST、*ST、退市股票。
-
-请返回：
-股票代码、股票简称、最新价、涨跌幅、换手率。
-
-不要因为缺少市值、龙虎榜或涨停次数而不返回股票。
-"""
-
-
-def mx_query():
-
-    key = os.getenv("MX_APIKEY")
-
-    if not key:
-        raise RuntimeError("MX_APIKEY 未设置")
-
-    r = requests.post(
-        MX_URL,
-        headers={
-            "Content-Type": "application/json",
-            "apikey": key
-        },
-        json={
-            "keyword": QUERY
-        },
-        timeout=40
-    )
-
-    r.raise_for_status()
-
-    return r.json()
-
-
-def parse_mx(obj):
-
-    outer = obj.get("data") or {}
-    inner = outer.get("data") or {}
-
-    result = (
-        (inner.get("allResults") or {})
-        .get("result") or {}
-    )
-
-    rows = result.get("dataList") or []
-
-    if rows:
-        return rows
-
-    partial = inner.get("partialResults") or ""
-
-    lines = [
-        x.strip()
-        for x in str(partial).splitlines()
-        if x.strip().startswith("|")
-    ]
-
-    if len(lines) < 3:
-        return []
-
-    def cells(x):
-        return [
-            v.strip()
-            for v in x.strip("|").split("|")
-        ]
-
-    headers = cells(lines[0])
-
-    rows = []
-
-    for line in lines[2:]:
-
-        vals = cells(line)
-
-        if len(vals) != len(headers):
-            continue
-
-        rows.append(dict(zip(headers, vals)))
-
-    return rows
-
-
-def get_value(row, names):
-
-    for name in names:
-
-        if name in row:
-            value = row[name]
-
-            if value not in ("", None):
-                return value
-
-    for k, v in row.items():
-
-        if v in ("", None):
-            continue
-
-        for name in names:
-
-            if name.lower() in str(k).lower():
-                return v
-
-    return ""
-
-
-def number(v):
-
+def num(v, default=0.0):
     try:
-
-        if v is None:
-            return 0.0
-
-        s = str(v).strip()
-
-        if not s:
-            return 0.0
-
-        s = s.replace(",", "")
-        s = s.replace("%", "")
-
-        return float(s)
-
+        if v is None or v == "":
+            return default
+        return float(str(v).replace(",", "").replace("%", ""))
     except Exception:
+        return default
 
-        return 0.0
+
+def clean_code(v):
+    m = re.search(r"(\d{6})", str(v or ""))
+    return m.group(1) if m else ""
 
 
-def parse_candidates(rows):
+def secid(code):
+    c = clean_code(code)
+
+    if c.startswith(("6", "68")):
+        return "1." + c
+
+    return "0." + c
+
+
+def request_json(url, params=None, timeout=8):
+    try:
+        r = session.get(
+            url,
+            params=params,
+            timeout=timeout
+        )
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:
+        print("REQUEST ERROR:", url, repr(e))
+        return {}
+
+
+# =========================================================
+# 交易日
+# =========================================================
+
+def get_trading_dates(end_date, count=10):
+
+    params = {
+        "secid": "1.000001",
+        "fields1": "f1,f2,f3,f4,f5,f6",
+        "fields2": (
+            "f51,f52,f53,f54,f55,"
+            "f56,f57,f58,f59,f60"
+        ),
+        "klt": 101,
+        "fqt": 1,
+        "beg": "0",
+        "end": "20500101"
+    }
+
+    data = request_json(
+        f"{EASTMONEY}/api/qt/stock/kline/get",
+        params
+    )
+
+    rows = (
+        (data.get("data") or {}).get("klines")
+        or []
+    )
+
+    dates = []
+
+    for row in rows:
+        try:
+            d = str(row).split(",")[0]
+
+            dt = datetime.strptime(
+                d,
+                "%Y-%m-%d"
+            ).date()
+
+            if dt <= end_date:
+                dates.append(dt)
+
+        except Exception:
+            pass
+
+    return sorted(
+        set(dates),
+        reverse=True
+    )[:count]
+
+
+def get_actual_date(date):
+    dates = get_trading_dates(
+        date,
+        3
+    )
+
+    if dates:
+        return dates[0]
+
+    return date
+
+
+# =========================================================
+# 涨停池
+# =========================================================
+
+def get_zt_pool(date):
+
+    params = {
+        "date": date.strftime("%Y%m%d"),
+        "pageindex": 0,
+        "pagesize": 200,
+        "sort": "fbt:asc"
+    }
+
+    data = request_json(
+        f"{EASTMONEY_EX}/getTopicZTPool",
+        params
+    )
+
+    rows = (
+        (data.get("data") or {}).get("pool")
+        or []
+    )
+
+    result = set()
+
+    for row in rows:
+
+        code = clean_code(
+            row.get("c")
+            or row.get("code")
+            or row.get("SECURITY_CODE")
+        )
+
+        if code:
+            result.add(code)
+
+    return result
+
+
+# =========================================================
+# A股市场
+# =========================================================
+
+def get_all_a():
+
+    params = {
+        "pn": 1,
+        "pz": 5000,
+        "po": 1,
+        "np": 1,
+        "ut": "bd1d9ddb04089700cf9c27f6f7426281",
+        "fltt": 2,
+        "invt": 2,
+        "fid": "f3",
+        "fs": (
+            "m:0+t:6,"
+            "m:0+t:80,"
+            "m:1+t:2,"
+            "m:1+t:23"
+        ),
+        "fields": (
+            "f2,f3,f8,f12,f14,f20,f21"
+        )
+    }
+
+    data = request_json(
+        f"{EASTMONEY}/api/qt/clist/get",
+        params,
+        timeout=10
+    )
+
+    rows = (
+        (data.get("data") or {}).get("diff")
+        or []
+    )
 
     result = []
 
     for row in rows:
 
-        code = str(get_value(
-            row,
-            [
-                "SECURITY_CODE",
-                "股票代码",
-                "证券代码",
-                "代码"
-            ]
-        )).strip()
-
-        name = str(get_value(
-            row,
-            [
-                "SECURITY_SHORT_NAME",
-                "SECURITY_NAME_ABBR",
-                "股票简称",
-                "证券简称",
-                "名称"
-            ]
-        )).strip()
-
-        code = "".join(
-            x for x in code if x.isdigit()
+        code = clean_code(
+            row.get("f12")
         )
 
-        if len(code) != 6:
-            continue
+        name = str(
+            row.get("f14") or ""
+        )
 
-        if not name:
+        if not code:
             continue
 
         if "ST" in name.upper():
             continue
 
-        if name.startswith("退"):
+        if "退" in name:
             continue
-
-        price = number(get_value(
-            row,
-            [
-                "NEWEST_PRICE",
-                "最新价",
-                "现价"
-            ]
-        ))
-
-        pct = number(get_value(
-            row,
-            [
-                "CHG",
-                "涨跌幅",
-                "涨幅"
-            ]
-        ))
-
-        turnover = number(get_value(
-            row,
-            [
-                "TURNOVER_RATE",
-                "换手率",
-                "HSL"
-            ]
-        ))
 
         result.append({
             "code": code,
             "name": name,
-            "price": price,
-            "pct": pct,
-            "turnover": turnover
+            "price": num(row.get("f2")),
+            "pct": num(row.get("f3")),
+            "turnover": num(row.get("f8")),
+            "market_cap": num(row.get("f20")) / 1e8,
+            "float_cap": num(row.get("f21")) / 1e8
         })
-
-    # 去重
-    unique = {}
-
-    for x in result:
-        unique[x["code"]] = x
-
-    return list(unique.values())
-
-
-# =========================================================
-# 东方财富实时行情
-# =========================================================
-
-def market_of(code):
-
-    if code.startswith(("6", "68")):
-        return "1"
-
-    return "0"
-
-
-def get_quotes(codes):
-
-    if not codes:
-        return {}
-
-    secids = ",".join(
-        market_of(c) + "." + c
-        for c in codes
-    )
-
-    url = (
-        "https://push2.eastmoney.com/"
-        "api/qt/ulist.np/get"
-    )
-
-    params = {
-        "fltt": "2",
-        "invt": "2",
-        "secids": secids,
-        "fields": (
-            "f2,f3,f8,f12,f13,f14,f20,f21"
-        )
-    }
-
-    try:
-
-        r = requests.get(
-            url,
-            params=params,
-            headers=HEADERS,
-            timeout=15
-        )
-
-        data = r.json()
-
-        diff = (
-            (data.get("data") or {})
-            .get("diff") or []
-        )
-
-        result = {}
-
-        for x in diff:
-
-            code = str(x.get("f12", ""))
-
-            result[code] = {
-                "price": float(x.get("f2") or 0),
-                "pct": float(x.get("f3") or 0),
-                "turnover": float(x.get("f8") or 0),
-                "market_cap": (
-                    float(x.get("f20") or 0)
-                    / 100000000
-                ),
-                "name": x.get("f14") or ""
-            }
-
-        return result
-
-    except Exception as e:
-
-        print("QUOTE_ERROR:", repr(e))
-
-        return {}
-
-
-# =========================================================
-# 最近交易日
-# =========================================================
-
-def get_trading_dates(count=3):
-
-    dates = []
-
-    day = datetime.now()
-
-    for _ in range(15):
-
-        d = day.strftime("%Y%m%d")
-
-        try:
-
-            url = (
-                "https://push2ex.eastmoney.com/"
-                "getTopicZTPool"
-            )
-
-            params = {
-                "ut": "7eea3edcaed734bea9cbfc24409ed989",
-                "dpt": "wz.ztzt",
-                "Pageindex": 0,
-                "pagesize": 1,
-                "sort": "fbt:asc",
-                "date": d
-            }
-
-            r = requests.get(
-                url,
-                params=params,
-                headers=HEADERS,
-                timeout=10
-            )
-
-            data = r.json()
-
-            pool = (
-                (data.get("data") or {})
-                .get("pool") or []
-            )
-
-            if pool:
-                dates.append(d)
-
-                if len(dates) >= count:
-                    break
-
-        except Exception as e:
-
-            print(
-                "TRADING_DATE_ERROR:",
-                repr(e)
-            )
-
-        day -= timedelta(days=1)
-
-    return dates
-
-
-# =========================================================
-# 近3日涨停
-# =========================================================
-
-def get_limit_up_counts(codes, dates):
-
-    result = {
-        code: 0
-        for code in codes
-    }
-
-    for d in dates:
-
-        try:
-
-            url = (
-                "https://push2ex.eastmoney.com/"
-                "getTopicZTPool"
-            )
-
-            params = {
-                "ut": "7eea3edcaed734bea9cbfc24409ed989",
-                "dpt": "wz.ztzt",
-                "Pageindex": 0,
-                "pagesize": 200,
-                "sort": "fbt:asc",
-                "date": d
-            }
-
-            r = requests.get(
-                url,
-                params=params,
-                headers=HEADERS,
-                timeout=15
-            )
-
-            data = r.json()
-
-            pool = (
-                (data.get("data") or {})
-                .get("pool") or []
-            )
-
-            for item in pool:
-
-                code = str(
-                    item.get("c", "")
-                ).zfill(6)
-
-                if code in result:
-                    result[code] += 1
-
-        except Exception as e:
-
-            print(
-                "ZT_ERROR:",
-                d,
-                repr(e)
-            )
 
     return result
 
@@ -457,334 +254,897 @@ def get_limit_up_counts(codes, dates):
 # 龙虎榜
 # =========================================================
 
-def get_lhb(codes, dates):
+def get_lhb(begin_date, end_date):
 
-    result = {
-        code: {
-            "net": 0.0,
-            "on_board": False
-        }
-        for code in codes
+    raw_filter = (
+        f"(TRADE_DATE>='{begin_date:%Y-%m-%d}')"
+        f"(TRADE_DATE<='{end_date:%Y-%m-%d}')"
+    )
+
+    params = {
+        "sortColumns": "TRADE_DATE,SECURITY_CODE",
+        "sortTypes": "-1,-1",
+        "pageNumber": 1,
+        "pageSize": 5000,
+        "reportName": "RPT_DAILYBILLBOARD_DETAILSNEW",
+        "columns": (
+            "SECURITY_CODE,"
+            "SECURITY_NAME_ABBR,"
+            "TRADE_DATE,"
+            "NET_BUY_AMT"
+        ),
+        "source": "WEB",
+        "client": "WEB",
+        "filter": quote(
+            raw_filter,
+            safe="()='"
+        )
     }
 
-    for d in dates:
+    data = request_json(
+        f"{DATACENTER}/api/data/v1/get",
+        params,
+        timeout=8
+    )
 
-        date_fmt = (
-            f"{d[:4]}-{d[4:6]}-{d[6:]}"
+    rows = (
+        (data.get("result") or {}).get("data")
+        or []
+    )
+
+    result = {}
+
+    for row in rows:
+
+        code = clean_code(
+            row.get("SECURITY_CODE")
         )
 
-        url = (
-            "https://datacenter-web.eastmoney.com/"
-            "api/data/v1/get"
-        )
+        if not code:
+            continue
 
-        params = {
-            "reportName":
-                "RPT_DAILYBILLBOARD_DETAILSNEW",
-
-            "columns":
-                "SECURITY_CODE,"
-                "SECURITY_NAME_ABBR,"
-                "BILLBOARD_NET_AMT,"
-                "BILLBOARD_BUY_AMT,"
-                "BILLBOARD_SELL_AMT,"
-                "TRADE_DATE",
-
-            "pageNumber": 1,
-            "pageSize": 500,
-
-            "sortColumns":
-                "BILLBOARD_NET_AMT",
-
-            "sortTypes": -1,
-
-            "source": "WEB",
-            "client": "WEB",
-
-            "filter":
-                f"(TRADE_DATE='{date_fmt}')"
+        result[code] = {
+            "net_buy": num(
+                row.get("NET_BUY_AMT")
+            ),
+            "date": str(
+                row.get("TRADE_DATE") or ""
+            )[:10]
         }
 
-        try:
-
-            r = requests.get(
-                url,
-                params=params,
-                headers=HEADERS,
-                timeout=15
-            )
-
-            data = r.json()
-
-            rows = (
-                (data.get("result") or {})
-                .get("data") or []
-            )
-
-            for row in rows:
-
-                code = str(
-                    row.get(
-                        "SECURITY_CODE",
-                        ""
-                    )
-                ).zfill(6)
-
-                if code not in result:
-                    continue
-
-                net = float(
-                    row.get(
-                        "BILLBOARD_NET_AMT",
-                        0
-                    ) or 0
-                )
-
-                # 龙虎榜金额：元 → 亿元
-                result[code]["net"] += (
-                    net / 100000000
-                )
-
-                result[code]["on_board"] = True
-
-        except Exception as e:
-
-            print(
-                "LHB_ERROR:",
-                date_fmt,
-                repr(e)
-            )
-
     return result
 
 
 # =========================================================
-# 最终评分
+# 实时行情
 # =========================================================
 
-def make_result(candidates):
+def get_quotes(codes):
 
-    codes = [
-        x["code"]
-        for x in candidates
-    ]
-
-    quotes = get_quotes(codes)
-
-    dates = get_trading_dates(3)
-
-    zt = get_limit_up_counts(
-        codes,
-        dates
+    codes = list(
+        dict.fromkeys(
+            clean_code(x)
+            for x in codes
+            if clean_code(x)
+        )
     )
 
-    # 龙虎榜至少检查最近几个交易日
-    lhb_dates = get_trading_dates(10)
+    result = {}
 
-    lhb = get_lhb(
-        codes,
-        lhb_dates
-    )
-
-    result = []
-
-    for x in candidates:
-
-        code = x["code"]
-
-        q = quotes.get(code, {})
-
-        price = q.get(
-            "price",
-            x["price"]
-        )
-
-        pct = q.get(
-            "pct",
-            x["pct"]
-        )
-
-        turnover = q.get(
-            "turnover",
-            x["turnover"]
-        )
-
-        market_cap = q.get(
-            "market_cap",
-            0
-        )
-
-        zt_count = zt.get(
-            code,
-            0
-        )
-
-        lhb_net = (
-            lhb.get(code, {})
-            .get("net", 0)
-        )
-
-        on_lhb = (
-            lhb.get(code, {})
-            .get("on_board", False)
-        )
-
-        # 三项硬条件
-        hard_zt = zt_count >= 1
-
-        hard_lhb = on_lhb
-
-        hard_cap = (
-            market_cap > 0
-            and market_cap <= 300
-        )
-
-        hard_count = sum([
-            hard_zt,
-            hard_lhb,
-            hard_cap
-        ])
-
-        # 妖股评分
-        score = 30
-
-        # 涨幅
-        if pct >= 5:
-            score += 10
-
-        if pct >= 7:
-            score += 5
-
-        if pct >= 9.5:
-            score += 5
-
-        # 换手
-        if turnover > 29.25:
-            score += 15
-        elif turnover > 20:
-            score += 10
-        elif turnover > 15:
-            score += 7
-        elif turnover > 8:
-            score += 4
-
-        # 龙虎榜
-        if on_lhb:
-            score += 10
-
-        if lhb_net > 1:
-            score += 5
-
-        if lhb_net < 0:
-            score += 2
-
-        # 涨停
-        if zt_count >= 3:
-            score += 15
-        elif zt_count >= 2:
-            score += 10
-        elif zt_count >= 1:
-            score += 5
-
-        result.append({
-            "code": code,
-            "name": q.get(
-                "name",
-                x["name"]
-            ),
-            "price": price,
-            "pct": pct,
-            "turnover": turnover,
-            "market_cap": market_cap,
-            "lhb_net": lhb_net,
-            "zt_count": zt_count,
-            "score": min(100, score),
-            "hard_count": hard_count,
-            "hard_zt": hard_zt,
-            "hard_lhb": hard_lhb,
-            "hard_cap": hard_cap
-        })
-
-    result.sort(
-        key=lambda x: (
-            x["hard_count"],
-            x["score"],
-            x["zt_count"],
-            x["lhb_net"],
-            x["pct"]
-        ),
-        reverse=True
-    )
-
-    return result
-
-
-# =========================================================
-# 主数据
-# =========================================================
-
-def get_data():
-
-    now = time.time()
-
-    if (
-        CACHE["data"]
-        and now - CACHE["ts"]
-        < CACHE_SECONDS
+    for i in range(
+        0,
+        len(codes),
+        500
     ):
-        return (
-            CACHE["data"],
-            CACHE["source"]
+
+        batch = codes[
+            i:i + 500
+        ]
+
+        params = {
+            "secids": ",".join(
+                secid(x)
+                for x in batch
+            ),
+            "fields": (
+                "f2,f3,f8,"
+                "f12,f14,f20,f21"
+            )
+        }
+
+        data = request_json(
+            f"{EASTMONEY}/api/qt/ulist.np/get",
+            params
         )
+
+        rows = (
+            (data.get("data") or {}).get("diff")
+            or []
+        )
+
+        for row in rows:
+
+            code = clean_code(
+                row.get("f12")
+            )
+
+            if not code:
+                continue
+
+            result[code] = {
+                "code": code,
+                "name": row.get(
+                    "f14"
+                ) or code,
+                "price": num(
+                    row.get("f2")
+                ),
+                "pct": num(
+                    row.get("f3")
+                ),
+                "turnover": num(
+                    row.get("f8")
+                ),
+                "market_cap": (
+                    num(row.get("f20"))
+                    / 1e8
+                ),
+                "float_cap": (
+                    num(row.get("f21"))
+                    / 1e8
+                )
+            }
+
+    return result
+
+
+# =========================================================
+# 当前盘口
+# =========================================================
+
+def get_order_book(code):
+
+    params = {
+        "secid": secid(code),
+        "fields": (
+            "f43,f44,f45,f46,f47,"
+            "f49,f50,f51,f52,f53"
+        )
+    }
+
+    data = request_json(
+        f"{EASTMONEY}/api/qt/stock/get",
+        params,
+        timeout=5
+    )
+
+    row = data.get("data") or {}
+
+    buy = sum(
+        num(row.get(x))
+        for x in (
+            "f49",
+            "f50",
+            "f51",
+            "f52",
+            "f53"
+        )
+    )
+
+    sell = sum(
+        num(row.get(x))
+        for x in (
+            "f43",
+            "f44",
+            "f45",
+            "f46",
+            "f47"
+        )
+    )
+
+    return {
+        "buy": buy,
+        "sell": sell
+    }
+
+
+# =========================================================
+# 妙想增强
+# =========================================================
+
+def get_mx_codes():
+
+    api_key = os.getenv(
+        "MX_APIKEY"
+    )
+
+    if not api_key:
+        return set()
 
     try:
 
-        raw = mx_query()
+        question = """
+请筛选今天A股最强势的股票候选。
+重点参考：
+1. 近期涨停
+2. 龙虎榜
+3. 市值300亿元以内
+4. 涨幅
+5. 换手率
+6. 市场活跃度
 
-        rows = parse_mx(raw)
+排除ST、退市。
+尽量返回股票代码。
+"""
 
-        candidates = parse_candidates(rows)
-
-        print(
-            "MX_CANDIDATES:",
-            len(candidates)
+        response = session.post(
+            MX_URL,
+            headers={
+                "Content-Type":
+                    "application/json",
+                "apikey":
+                    api_key
+            },
+            json={
+                "keyword": question
+            },
+            timeout=5
         )
 
-        data = make_result(
-            candidates
-        )
+        text = response.text
 
-        CACHE["ts"] = now
-        CACHE["data"] = data
-
-        CACHE["source"] = (
-            "妙想选股 + 东方财富公开数据"
-        )
-
-        return (
-            data,
-            CACHE["source"]
+        return set(
+            re.findall(
+                r"(?<!\d)(?:0|3|6)\d{5}(?!\d)",
+                text
+            )
         )
 
     except Exception as e:
 
         print(
-            "MAIN_ERROR:",
+            "MX ERROR:",
             repr(e)
         )
 
-        CACHE["ts"] = now
-        CACHE["data"] = []
+        return set()
 
-        CACHE["source"] = (
-            "接口异常：" +
-            str(e)[:150]
+
+# =========================================================
+# 妖股评分模型
+# =========================================================
+
+def calculate_score(
+    quote,
+    zt_count,
+    lhb_info,
+    order_book=None,
+    mx=False
+):
+
+    score = 0
+    reasons = []
+
+    # -----------------------------------------------------
+    # 核心一：近3日涨停
+    # -----------------------------------------------------
+
+    if zt_count >= 3:
+
+        score += 30
+
+        reasons.append(
+            "近3日3次涨停"
         )
 
-        return (
-            [],
-            CACHE["source"]
+    elif zt_count == 2:
+
+        score += 24
+
+        reasons.append(
+            "近3日2次涨停"
         )
+
+    elif zt_count == 1:
+
+        score += 17
+
+        reasons.append(
+            "近3日有涨停"
+        )
+
+    # -----------------------------------------------------
+    # 核心二：龙虎榜
+    # -----------------------------------------------------
+
+    if lhb_info:
+
+        score += 18
+
+        reasons.append(
+            "上过龙虎榜"
+        )
+
+        net_buy = num(
+            lhb_info.get(
+                "net_buy"
+            )
+        )
+
+        if net_buy >= 2e8:
+
+            score += 10
+
+            reasons.append(
+                "龙虎榜净买入强"
+            )
+
+        elif net_buy >= 1e8:
+
+            score += 7
+
+            reasons.append(
+                "龙虎榜净买入"
+            )
+
+        elif net_buy > 0:
+
+            score += 3
+
+    # -----------------------------------------------------
+    # 核心三：市值
+    # -----------------------------------------------------
+
+    market_cap = num(
+        quote.get(
+            "market_cap"
+        )
+    )
+
+    if market_cap <= 50:
+
+        score += 15
+
+        reasons.append(
+            "市值≤50亿"
+        )
+
+    elif market_cap <= 100:
+
+        score += 12
+
+        reasons.append(
+            "市值≤100亿"
+        )
+
+    elif market_cap <= 200:
+
+        score += 9
+
+        reasons.append(
+            "市值≤200亿"
+        )
+
+    elif market_cap <= 300:
+
+        score += 5
+
+        reasons.append(
+            "市值≤300亿"
+        )
+
+    # -----------------------------------------------------
+    # 涨幅
+    # -----------------------------------------------------
+
+    pct = num(
+        quote.get("pct")
+    )
+
+    if pct >= 9:
+
+        score += 14
+
+        reasons.append(
+            "涨幅接近涨停"
+        )
+
+    elif pct >= 7:
+
+        score += 11
+
+        reasons.append(
+            "涨幅强势"
+        )
+
+    elif pct >= 5:
+
+        score += 8
+
+        reasons.append(
+            "涨幅5%+"
+        )
+
+    elif pct >= 3:
+
+        score += 4
+
+    elif pct < -3:
+
+        score -= 5
+
+    # -----------------------------------------------------
+    # 换手
+    # -----------------------------------------------------
+
+    turnover = num(
+        quote.get(
+            "turnover"
+        )
+    )
+
+    if 15 <= turnover < 30:
+
+        score += 10
+
+        reasons.append(
+            "换手活跃"
+        )
+
+    elif turnover >= 30:
+
+        score += 12
+
+        reasons.append(
+            "超高换手"
+        )
+
+    elif 8 <= turnover < 15:
+
+        score += 6
+
+    elif turnover >= 5:
+
+        score += 3
+
+    # -----------------------------------------------------
+    # 盘口
+    # -----------------------------------------------------
+
+    if order_book:
+
+        buy = num(
+            order_book.get(
+                "buy"
+            )
+        )
+
+        sell = num(
+            order_book.get(
+                "sell"
+            )
+        )
+
+        if buy > 0 and sell > 0:
+
+            ratio = sell / buy
+
+            if ratio >= 1.5:
+
+                score += 6
+
+                reasons.append(
+                    "卖盘明显强"
+                )
+
+            elif ratio >= 1.1:
+
+                score += 3
+
+                reasons.append(
+                    "卖盘略强"
+                )
+
+            elif ratio < 0.8:
+
+                score += 6
+
+                reasons.append(
+                    "买盘明显强"
+                )
+
+    # -----------------------------------------------------
+    # 妙想
+    # -----------------------------------------------------
+
+    if mx:
+
+        score += 5
+
+        reasons.append(
+            "妙想模型增强"
+        )
+
+    # -----------------------------------------------------
+    # 概率
+    # -----------------------------------------------------
+
+    # 不再简单把分数硬套成概率，
+    # 而是压缩到 1~99 区间。
+
+    probability = round(
+        100 /
+        (
+            1 +
+            pow(
+                2.71828,
+                -(score - 45) / 14
+            )
+        )
+    )
+
+    probability = max(
+        1,
+        min(
+            99,
+            probability
+        )
+    )
+
+    return (
+        score,
+        probability,
+        reasons
+    )
+
+
+# =========================================================
+# 主扫描
+# =========================================================
+
+def build_scan(target_date):
+
+    actual = get_actual_date(
+        target_date
+    )
+
+    dates = get_trading_dates(
+        actual,
+        5
+    )
+
+    last3 = dates[:3]
+
+    if not last3:
+        last3 = [actual]
+
+    # -----------------------------------------------------
+    # 涨停
+    # -----------------------------------------------------
+
+    zt_map = {}
+
+    for d in last3:
+
+        zt_map[d] = get_zt_pool(
+            d
+        )
+
+    zt_codes = set()
+
+    for codes in zt_map.values():
+
+        zt_codes |= codes
+
+    # -----------------------------------------------------
+    # 龙虎榜
+    # -----------------------------------------------------
+
+    lhb_map = get_lhb(
+        actual -
+        timedelta(days=14),
+        actual
+    )
+
+    lhb_codes = set(
+        lhb_map.keys()
+    )
+
+    # -----------------------------------------------------
+    # 全市场
+    # -----------------------------------------------------
+
+    stocks = get_all_a()
+
+    stock_map = {
+        x["code"]: x
+        for x in stocks
+    }
+
+    # -----------------------------------------------------
+    # 活跃股票
+    # -----------------------------------------------------
+
+    active = sorted(
+        stocks,
+        key=lambda x: (
+            num(x.get("pct")),
+            num(x.get("turnover"))
+        ),
+        reverse=True
+    )
+
+    # -----------------------------------------------------
+    # 关键优化
+    #
+    # 不再使用：
+    # 涨停 AND 龙虎榜 AND 市值≤300亿
+    #
+    # 而是：
+    # 活跃股 OR 涨停股 OR 龙虎榜股
+    #
+    # 三项最后统一评分。
+    # -----------------------------------------------------
+
+    candidate_codes = set(
+        x["code"]
+        for x in active[:400]
+    )
+
+    candidate_codes |= zt_codes
+    candidate_codes |= lhb_codes
+
+    # 最多500只，防止 Render 超时
+
+    candidate_codes = list(
+        candidate_codes
+    )[:500]
+
+    # -----------------------------------------------------
+    # 实时行情
+    # -----------------------------------------------------
+
+    quotes = get_quotes(
+        candidate_codes
+    )
+
+    # -----------------------------------------------------
+    # 妙想
+    # -----------------------------------------------------
+
+    mx = set()
+
+    if actual == TODAY:
+
+        mx = get_mx_codes()
+
+    # -----------------------------------------------------
+    # 第一轮评分
+    # -----------------------------------------------------
+
+    results = []
+
+    for code, quote in quotes.items():
+
+        zt_count = sum(
+            code in zt_map.get(
+                d,
+                set()
+            )
+            for d in last3
+        )
+
+        lhb_info = lhb_map.get(
+            code
+        )
+
+        score, probability, reasons = (
+            calculate_score(
+                quote=quote,
+                zt_count=zt_count,
+                lhb_info=lhb_info,
+                order_book=None,
+                mx=code in mx
+            )
+        )
+
+        results.append({
+            "code": code,
+            "name": quote.get(
+                "name",
+                code
+            ),
+            "price": round(
+                num(
+                    quote.get(
+                        "price"
+                    )
+                ),
+                2
+            ),
+            "pct": round(
+                num(
+                    quote.get(
+                        "pct"
+                    )
+                ),
+                2
+            ),
+            "turnover": round(
+                num(
+                    quote.get(
+                        "turnover"
+                    )
+                ),
+                2
+            ),
+            "market_cap": round(
+                num(
+                    quote.get(
+                        "market_cap"
+                    )
+                ),
+                2
+            ),
+            "zt_count": zt_count,
+            "lhb": bool(
+                lhb_info
+            ),
+            "lhb_net_buy": round(
+                num(
+                    (lhb_info or {}).get(
+                        "net_buy"
+                    )
+                ) / 1e8,
+                2
+            ),
+            "score": score,
+            "probability": probability,
+            "reasons": reasons,
+            "order_book": None
+        })
+
+    # -----------------------------------------------------
+    # 第一轮排序
+    # -----------------------------------------------------
+
+    results.sort(
+        key=lambda x: (
+            x["score"],
+            x["zt_count"],
+            x["pct"],
+            x["turnover"]
+        ),
+        reverse=True
+    )
+
+    # -----------------------------------------------------
+    # 盘口只查前20
+    # -----------------------------------------------------
+
+    if actual == TODAY:
+
+        top20 = results[:20]
+
+        with ThreadPoolExecutor(
+            max_workers=8
+        ) as executor:
+
+            future_map = {
+                executor.submit(
+                    get_order_book,
+                    x["code"]
+                ): x
+                for x in top20
+            }
+
+            for future in as_completed(
+                future_map
+            ):
+
+                item = future_map[
+                    future
+                ]
+
+                try:
+
+                    book = future.result()
+
+                    item[
+                        "order_book"
+                    ] = book
+
+                    s, p, r = (
+                        calculate_score(
+                            quote=quotes[
+                                item["code"]
+                            ],
+                            zt_count=item[
+                                "zt_count"
+                            ],
+                            lhb_info=lhb_map.get(
+                                item["code"]
+                            ),
+                            order_book=book,
+                            mx=item["code"] in mx
+                        )
+                    )
+
+                    item[
+                        "score"
+                    ] = s
+
+                    item[
+                        "probability"
+                    ] = p
+
+                    item[
+                        "reasons"
+                    ] = r
+
+                except Exception:
+                    pass
+
+    # -----------------------------------------------------
+    # 最终排序
+    # -----------------------------------------------------
+
+    results.sort(
+        key=lambda x: (
+            x["score"],
+            x["zt_count"],
+            x["pct"],
+            x["turnover"]
+        ),
+        reverse=True
+    )
+
+    # -----------------------------------------------------
+    # TOP3
+    # -----------------------------------------------------
+
+    top3 = results[:3]
+
+    return {
+        "success": True,
+        "version": VERSION,
+        "date": str(actual),
+        "requested_date": str(
+            target_date
+        ),
+        "is_today": (
+            actual == TODAY
+        ),
+
+        "message": (
+            "三个核心指标均为评分项，"
+            "不要求同时满足。"
+        ),
+
+        "core_rules": [
+            "近3个交易日出现涨停：评分项",
+            "上过龙虎榜：评分项",
+            "总市值≤300亿：评分项"
+        ],
+
+        "top3": top3,
+
+        "ranking": results[:50],
+
+        "stats": {
+            "candidate_count":
+                len(candidate_codes),
+
+            "result_count":
+                len(results),
+
+            "zt_count":
+                len(zt_codes),
+
+            "lhb_count":
+                len(lhb_codes)
+        }
+    }
 
 
 # =========================================================
@@ -796,377 +1156,294 @@ def health():
 
     return {
         "status": "ok",
-        "mx_apikey_configured":
-            bool(os.getenv("MX_APIKEY"))
+        "version": VERSION,
+        "time":
+            datetime.now(
+                TZ
+            ).isoformat()
     }
 
 
 @app.get("/api/scanner")
-def scanner():
+def scanner(
+    date: str = Query(
+        default=str(TODAY)
+    )
+):
 
-    data, source = get_data()
+    try:
 
-    hard = [
-        x for x in data
-        if (
-            x["hard_zt"]
-            and x["hard_lhb"]
-            and x["hard_cap"]
+        target = datetime.strptime(
+            date[:10],
+            "%Y-%m-%d"
+        ).date()
+
+        cache_key = str(
+            target
         )
-    ]
 
-    return {
-        "status": "ok",
-        "source": source,
-        "updated_at":
-            time.strftime(
-                "%Y-%m-%d %H:%M:%S"
-            ),
-        "trading_candidates":
-            len(data),
-        "hard_condition_count":
-            len(hard),
-        "top3":
-            hard[:3] if hard
-            else data[:3],
-        "data": data
-    }
+        now = time.time()
+
+        if (
+            cache_key in CACHE
+            and
+            now -
+            CACHE[cache_key][0]
+            < CACHE_SECONDS
+        ):
+
+            return CACHE[
+                cache_key
+            ][1]
+
+        data = build_scan(
+            target
+        )
+
+        CACHE[
+            cache_key
+        ] = (
+            now,
+            data
+        )
+
+        return data
+
+    except Exception as e:
+
+        print(
+            "SCAN ERROR:",
+            repr(e)
+        )
+
+        return {
+            "success": False,
+            "version": VERSION,
+            "error": str(e),
+            "top3": [],
+            "ranking": []
+        }
 
 
 # =========================================================
 # 页面
 # =========================================================
 
-@app.get("/", response_class=HTMLResponse)
-def home():
-
-    data, source = get_data()
-
-    hard = [
-        x for x in data
-        if (
-            x["hard_zt"]
-            and x["hard_lhb"]
-            and x["hard_cap"]
-        )
-    ]
-
-    top3 = (
-        hard[:3]
-        if hard
-        else data[:3]
-    )
-
-    if top3:
-
-        cards = ""
-
-        for i, x in enumerate(top3):
-
-            cards += f"""
-            <div class="card">
-
-                <div class="rank">
-                    #{i+1}
-                    · 硬条件
-                    {x["hard_count"]}/3
-                </div>
-
-                <div class="name">
-                    {html.escape(x["name"])}
-                </div>
-
-                <div class="code">
-                    {x["code"]}
-                </div>
-
-                <div class="bigscore">
-                    {x["score"]}
-                    <small>分</small>
-
-                    <span>
-                        {x["pct"]:+.2f}%
-                    </span>
-                </div>
-
-                <div class="detail">
-
-                    市值：
-                    {x["market_cap"]:.2f}亿
-
-                    <br>
-
-                    龙虎榜：
-                    {x["lhb_net"]:+.2f}亿
-
-                    <br>
-
-                    近3日涨停：
-                    {x["zt_count"]}次
-
-                    <br>
-
-                    换手：
-                    {x["turnover"]:.2f}%
-
-                </div>
-
-            </div>
-            """
-
-    else:
-
-        cards = """
-        <div class="empty">
-            暂无候选股票
-        </div>
-        """
-
-    rows = ""
-
-    for x in data:
-
-        rows += f"""
-        <tr>
-
-            <td>{x["code"]}</td>
-
-            <td>
-                <b>{html.escape(x["name"])}</b>
-            </td>
-
-            <td>
-                {x["price"]:.2f}
-            </td>
-
-            <td class="up">
-                {x["pct"]:+.2f}%
-            </td>
-
-            <td>
-                {x["turnover"]:.2f}%
-            </td>
-
-            <td>
-                {x["market_cap"]:.2f}亿
-            </td>
-
-            <td>
-                {x["lhb_net"]:+.2f}亿
-            </td>
-
-            <td>
-                {x["zt_count"]}次
-            </td>
-
-            <td>
-                {x["hard_count"]}/3
-            </td>
-
-            <td class="score">
-                {x["score"]}
-            </td>
-
-        </tr>
-        """
-
-    if not rows:
-
-        rows = """
-        <tr>
-            <td colspan="10"
-                class="empty">
-                暂无数据
-            </td>
-        </tr>
-        """
-
-    updated = time.strftime(
-        "%Y-%m-%d %H:%M:%S"
-    )
-
-    return f"""
-<!doctype html>
-
+HTML = r"""
+<!DOCTYPE html>
 <html lang="zh-CN">
 
 <head>
 
-<meta charset="utf-8">
+<meta charset="UTF-8">
 
 <meta name="viewport"
 content="width=device-width,
 initial-scale=1,
 maximum-scale=1">
 
-<meta http-equiv="refresh"
-content="60">
-
 <title>🔥 妖股雷达</title>
 
 <style>
 
-* {{
+*{
 box-sizing:border-box;
-}}
+}
 
-body {{
+body{
 margin:0;
-background:#070b11;
-color:#edf2f8;
+background:#050505;
+color:#eee;
 font-family:
 -apple-system,
 BlinkMacSystemFont,
 "PingFang SC",
 "Microsoft YaHei",
 sans-serif;
-}}
+}
 
-.wrap {{
-max-width:1200px;
+.container{
+max-width:900px;
 margin:auto;
-padding:16px 10px;
-}}
+padding:16px;
+}
 
-h1 {{
-margin:0;
+.header{
+display:flex;
+justify-content:space-between;
+align-items:center;
+margin-bottom:15px;
+}
+
+.title{
 font-size:25px;
-}}
+font-weight:900;
+}
 
-.sub {{
-color:#8390a3;
-line-height:1.7;
-margin:7px 0 12px;
-}}
-
-.status {{
-display:inline-block;
-padding:7px 10px;
-border-radius:9px;
-background:#111b25;
-border:1px solid #263443;
-color:#62e59a;
+.status{
 font-size:12px;
-margin-bottom:12px;
-}}
+color:#888;
+}
 
-.tops {{
+.panel{
+background:#111;
+border:1px solid #292929;
+border-radius:15px;
+padding:15px;
+margin-bottom:14px;
+}
+
+.controls{
+display:flex;
+gap:8px;
+}
+
+input{
+flex:1;
+background:#080808;
+color:#fff;
+border:1px solid #333;
+border-radius:9px;
+padding:11px;
+font-size:16px;
+}
+
+button{
+border:0;
+border-radius:9px;
+padding:11px 16px;
+background:#e31313;
+color:#fff;
+font-weight:bold;
+}
+
+button.gray{
+background:#333;
+}
+
+.rule{
+padding:9px;
+margin-top:7px;
+background:#181818;
+border-radius:8px;
+font-size:14px;
+color:#bbb;
+}
+
+.rule b{
+color:#ff4b4b;
+}
+
+.note{
+font-size:12px;
+color:#888;
+line-height:1.8;
+margin-top:10px;
+}
+
+.top3{
 display:grid;
 grid-template-columns:
 repeat(3,1fr);
 gap:10px;
-margin-bottom:12px;
-}}
+}
 
-.card,
-.box {{
-background:#101722;
-border:1px solid #202d3c;
-border-radius:14px;
-}}
-
-.card {{
+.card{
+background:#171717;
+border:1px solid #303030;
+border-radius:12px;
 padding:14px;
-}}
+}
 
-.rank,
-.code,
-.detail {{
-color:#7f8da1;
+.rank{
 font-size:12px;
-}}
+color:#888;
+}
 
-.name {{
+.name{
 font-size:19px;
-font-weight:700;
+font-weight:900;
 margin-top:4px;
-}}
+}
 
-.bigscore {{
-color:#ffb54a;
-font-size:28px;
-font-weight:800;
-margin-top:10px;
-}}
-
-.bigscore small {{
+.code{
 font-size:12px;
-font-weight:400;
-}}
+color:#888;
+}
 
-.bigscore span {{
-color:#ff4d67;
-font-size:17px;
-margin-left:8px;
-}}
-
-.detail {{
+.prob{
+font-size:30px;
+font-weight:900;
+color:#ff4141;
 margin-top:7px;
-line-height:1.7;
-}}
+}
 
-.box {{
-overflow:auto;
-}}
-
-table {{
-width:100%;
-min-width:1000px;
-border-collapse:collapse;
-}}
-
-th,
-td {{
-padding:11px 9px;
-border-bottom:
-1px solid #202d3c;
-text-align:left;
-}}
-
-th {{
-color:#8795a9;
-font-size:12px;
-}}
-
-td {{
+.score{
 font-size:13px;
-}}
+color:#aaa;
+}
 
-.up {{
-color:#ff4d67;
-font-weight:700;
-}}
-
-.score {{
-color:#ffb54a;
-font-size:17px;
-font-weight:800;
-}}
-
-.empty {{
-padding:28px;
-text-align:center;
-color:#7f8da1;
-}}
-
-.note {{
-margin-top:10px;
-color:#69778b;
+.reason{
 font-size:12px;
 line-height:1.8;
-}}
+color:#bbb;
+margin-top:7px;
+}
 
-@media(max-width:700px) {{
+.table{
+overflow-x:auto;
+}
 
-.tops {{
+table{
+width:100%;
+min-width:720px;
+border-collapse:collapse;
+}
+
+th,
+td{
+padding:9px 6px;
+border-bottom:
+1px solid #242424;
+text-align:center;
+font-size:13px;
+}
+
+th{
+color:#888;
+}
+
+.red{
+color:#ff4b4b;
+}
+
+.green{
+color:#00d084;
+}
+
+.error{
+background:#2a0d0d;
+border:1px solid #572020;
+color:#ff7777;
+padding:12px;
+border-radius:9px;
+}
+
+@media(max-width:600px){
+
+.top3{
 grid-template-columns:1fr;
-}}
+}
 
-h1 {{
-font-size:23px;
-}}
+.controls{
+flex-wrap:wrap;
+}
 
-}}
+.title{
+font-size:22px;
+}
+
+}
 
 </style>
 
@@ -1174,38 +1451,101 @@ font-size:23px;
 
 <body>
 
-<div class="wrap">
+<div class="container">
 
-<h1>
+<div class="header">
+
+<div class="title">
 🔥 妖股雷达
-</h1>
+</div>
 
-<div class="sub">
-
-硬条件：
-近3交易日涨停 + 龙虎榜 + 总市值 ≤ 300亿
-
-<br>
-
-评分：
-涨幅 + 换手率 + 龙虎榜资金
-+ 近3日涨停次数 + 竞价强弱
+<div
+id="status"
+class="status">
+v4.0
+</div>
 
 </div>
 
-<div class="status">
 
-● {html.escape(source)}
+<div class="panel">
+
+<div class="controls">
+
+<input
+id="date"
+type="date">
+
+<button
+onclick="scan()">
+开始扫描
+</button>
+
+<button
+class="gray"
+onclick="today()">
+今天
+</button>
 
 </div>
 
-<div class="tops">
 
-{cards}
+<div class="rule">
+① <b>近3个交易日出现涨停</b>
+：评分项
+</div>
+
+<div class="rule">
+② <b>上过龙虎榜</b>
+：评分项
+</div>
+
+<div class="rule">
+③ <b>总市值 ≤ 300亿</b>
+：评分项
+</div>
+
+
+<div class="note">
+
+三个核心指标不再要求同时满足。
+
+系统综合：
+涨停、龙虎榜、市值、
+涨幅、换手、盘口、
+妙想增强等因素进行排序。
 
 </div>
 
-<div class="box">
+</div>
+
+
+<div
+id="error">
+</div>
+
+
+<div class="panel">
+
+<h3>
+🔥 TOP 3 强势标的
+</h3>
+
+<div
+id="top3"
+class="top3">
+</div>
+
+</div>
+
+
+<div class="panel">
+
+<h3>
+📊 妖股概率排行
+</h3>
+
+<div class="table">
 
 <table>
 
@@ -1213,52 +1553,385 @@ font-size:23px;
 
 <tr>
 
-<th>代码</th>
-<th>名称</th>
-<th>现价</th>
+<th>排名</th>
+<th>股票</th>
+<th>概率</th>
+<th>评分</th>
 <th>涨幅</th>
 <th>换手</th>
 <th>市值</th>
-<th>龙虎榜净额</th>
-<th>近3日涨停</th>
-<th>硬条件</th>
-<th>妖股评分</th>
+<th>3日涨停</th>
+<th>龙虎榜</th>
 
 </tr>
 
 </thead>
 
-<tbody>
-
-{rows}
-
+<tbody
+id="ranking">
 </tbody>
 
 </table>
 
 </div>
 
+</div>
+
+
 <div class="note">
 
-更新时间：
-{updated}
-
-<br>
-
-数据源：
-妙想选股 + 东方财富公开数据
-
-<br>
-
-每60秒自动刷新
-
-<br>
-
-⚠️ 妖股评分仅用于量化筛选和研究，不构成投资建议。
+数据源：东方财富公开行情接口。
+妖股雷达用于量化分析参考，
+不构成投资建议。
 
 </div>
 
 </div>
+
+
+<script>
+
+function setToday(){
+
+const d =
+new Date();
+
+const y =
+d.getFullYear();
+
+const m =
+String(
+d.getMonth()+1
+).padStart(2,"0");
+
+const day =
+String(
+d.getDate()
+).padStart(2,"0");
+
+document
+.getElementById("date")
+.value =
+y+"-"+m+"-"+day;
+
+}
+
+
+function today(){
+
+setToday();
+
+scan();
+
+}
+
+
+async function scan(){
+
+const date =
+document
+.getElementById("date")
+.value;
+
+const status =
+document
+.getElementById("status");
+
+const error =
+document
+.getElementById("error");
+
+status.innerText =
+"扫描中...";
+
+error.innerHTML =
+"";
+
+
+try{
+
+const response =
+await fetch(
+"/api/scanner?date="
++
+encodeURIComponent(date)
+);
+
+const data =
+await response.json();
+
+
+if(!data.success){
+
+throw new Error(
+data.error ||
+"接口返回失败"
+);
+
+}
+
+
+status.innerText =
+"数据成功 · "
++
+data.version
++
+" · "
++
+data.date;
+
+
+render(data);
+
+
+}catch(e){
+
+status.innerText =
+"扫描失败";
+
+error.innerHTML =
+'<div class="error">'
++
+'加载失败：'
++
+e.message
++
+'</div>';
+
+}
+
+}
+
+
+function render(data){
+
+const top =
+document
+.getElementById("top3");
+
+const ranking =
+document
+.getElementById("ranking");
+
+top.innerHTML =
+"";
+
+ranking.innerHTML =
+"";
+
+
+if(
+!data.top3 ||
+data.top3.length === 0
+){
+
+top.innerHTML =
+'<div class="note">'
++
+'暂无候选数据'
++
+'</div>';
+
+return;
+
+}
+
+
+data.top3.forEach(
+function(x,i){
+
+top.innerHTML +=
+
+'<div class="card">'
+
++
+
+'<div class="rank">'
++
+'TOP '
++
+(i+1)
++
+'</div>'
+
++
+
+'<div class="name">'
++
+x.name
++
+'</div>'
+
++
+
+'<div class="code">'
++
+x.code
++
+'</div>'
+
++
+
+'<div class="prob">'
++
+x.probability
++
+'%'
++
+'</div>'
+
++
+
+'<div class="score">'
++
+'综合评分：'
++
+x.score
++
+'</div>'
+
++
+
+'<div class="reason">'
++
+x.reasons.join(
+' · '
+)
++
+'</div>'
+
++
+
+'</div>';
+
+});
+
+
+data.ranking.forEach(
+function(x,i){
+
+ranking.innerHTML +=
+
+'<tr>'
+
++
+
+'<td>'
++
+(i+1)
++
+'</td>'
+
++
+
+'<td>'
++
+'<b>'
++
+x.name
++
+'</b>'
++
+'<br>'
++
+x.code
++
+'</td>'
+
++
+
+'<td class="red">'
++
+x.probability
++
+'%'
++
+'</td>'
+
++
+
+'<td>'
++
+x.score
++
+'</td>'
+
++
+
+'<td class="'
++
+(
+x.pct >= 0
+?
+'red'
+:
+'green'
+)
++
+'">'
++
+x.pct
++
+'%'
++
+'</td>'
+
++
+
+'<td>'
++
+x.turnover
++
+'%'
++
+'</td>'
+
++
+
+'<td>'
++
+x.market_cap
++
+'亿'
++
+'</td>'
+
++
+
+'<td>'
++
+x.zt_count
++
+'</td>'
+
++
+
+'<td>'
++
+(
+x.lhb
+?
+'✓'
+:
+'-'
+)
++
+'</td>'
+
++
+
+'</tr>';
+
+});
+
+}
+
+
+setToday();
+
+scan();
+
+</script>
 
 </body>
 
@@ -1266,17 +1939,10 @@ font-size:23px;
 """
 
 
-if __name__ == "__main__":
+@app.get(
+    "/",
+    response_class=HTMLResponse
+)
+def home():
 
-    import uvicorn
-
-    uvicorn.run(
-        app,
-        host="0.0.0.0",
-        port=int(
-            os.getenv(
-                "PORT",
-                "10000"
-            )
-        )
-    )
+    return HTML
