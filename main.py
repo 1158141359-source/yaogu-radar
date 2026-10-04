@@ -4,16 +4,16 @@ main.py — 游资 AI 选股工作模式 · 选股 / 打分 / 买卖点 脚本
 ================================================================
 把用户自定义的五条选股条件、多因子打分模型、援军战法买卖点规则
 固化成可运行的 Python 脚本。
-
+> 适配Render Web Service：增加FastAPI HTTP接口，服务常驻
 用法:
     1) 准备日线数据(CSV，每只股票一个文件，或所有股票汇总文件)。
        列名固定为: date, open, high, low, close, volume
        示例一行: 2026-09-29,10.50,11.20,10.40,11.05,25000000
     2) 数据文件放入 DATA_DIR 目录(默认 ./data/*.csv)。
-    3) 运行:  python main.py
-    4) 可选参数:
-         --top 5              # 输出前几只(默认 3)
-         --min-date 2026-01-01  # 只分析该日期之后的行情
+    3) 本地运行: python main.py
+    4) API调用示例:
+        GET /run?top=3
+        GET /run?top=5&min-date=2026-01-01
 
 ================================================================
 免责声明：本脚本为方法论与流程的实现，仅用于研究/复盘，不构成任何
@@ -30,6 +30,8 @@ import os
 import sys
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
+from fastapi import FastAPI
+import uvicorn
 
 # ----------------------------------------------------------------------
 # 0. 配置
@@ -369,7 +371,7 @@ def analyze_trade(name: str, bars: List[Bar]) -> TradePlan:
 
 
 # ----------------------------------------------------------------------
-# 6. 主流程
+# 6. 原有主逻辑函数（CLI本地运行）
 # ----------------------------------------------------------------------
 def main() -> None:
     parser = argparse.ArgumentParser(description="游资 AI 选股工作模式·选股/打分/买卖点")
@@ -450,5 +452,74 @@ def main() -> None:
     print("=" * 66)
 
 
+# ----------------------------------------------------------------------
+# 7. FastAPI 接口部分（Render Web服务常驻）
+# ----------------------------------------------------------------------
+app = FastAPI(title="游资AI选股API", version="1.0")
+
+def run_strategy_api(top: int = 3, min_date: Optional[str] = None):
+    """API内部调用选股逻辑，返回JSON结果"""
+    all_data = load_all_bars(DATA_DIR, min_date)
+    if not all_data:
+        return {"code": 0, "msg": "data目录缺少csv行情数据", "data": []}
+
+    passed: Dict[str, List[Bar]] = {}
+    for name, bars in all_data.items():
+        checks = {
+            "连续5日上涨": condition_5_consec_up(bars),
+            "30日内涨停": condition_limit_up_in_30d(bars),
+            "收盘不破5日线": condition_close_above_ma5(bars),
+            "成交量堆量": condition_volume_accumulation(bars),
+            "底部筹码不动": condition_bottom_chips_stable(bars),
+        }
+        if all(checks.values()):
+            passed[name] = bars
+
+    if not passed:
+        return {"code": 1, "msg": "无股票满足全部五条选股条件，请放宽阈值或补充候选池", "data": []}
+
+    scores: List[StockScore] = []
+    for name, bars in passed.items():
+        sc = score_stock(name, bars)
+        scores.append(sc)
+    scores.sort(key=lambda s: s.total, reverse=True)
+    top_scores = scores[:top]
+
+    plans = {sc.name: analyze_trade(sc.name, passed[sc.name]) for sc in top_scores}
+    output_list = []
+    for sc in top_scores:
+        p = plans[sc.name]
+        output_list.append({
+            "stock_name": sc.name,
+            "total_score": sc.total,
+            "factor_detail": sc.factors,
+            "buy_point": p.buy_point,
+            "hold_rule": p.hold_rule,
+            "sell_point": p.sell_point,
+            "triggered_rules": p.triggered_rules
+        })
+    return {
+        "code": 200,
+        "msg": "选股成功",
+        "data": output_list
+    }
+
+
+@app.get("/")
+def index():
+    return {"message": "游资AI选股API服务已就绪", "usage": "访问 /run?top=3 执行选股"}
+
+
+@app.get("/run")
+def api_run(top: int = 3, min_date: str = None):
+    return run_strategy_api(top=top, min_date=min_date)
+
+
+# 程序入口：本地运行走CLI；Render部署走uvicorn web服务
 if __name__ == "__main__":
-    main()
+    # 判断启动参数，不带参数则启动web服务用于Render
+    if len(sys.argv) > 1:
+        main()
+    else:
+        port = int(os.environ.get("PORT", 8000))
+        uvicorn.run("main:app", host="0.0.0.0", port=port)
