@@ -1,1363 +1,1374 @@
+
+
 import os
+
+import math
+
 import time
-from datetime import datetime
+
+from datetime import datetime, timedelta
+
+from typing import Optional, Dict, List, Any
+
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
 from zoneinfo import ZoneInfo
-from typing import Any, Dict, List, Optional
+
+
 
 import requests
+
 from fastapi import FastAPI, Query
+
 from fastapi.responses import HTMLResponse
 
-app = FastAPI(title="妖股雷达")
-
-TZ = ZoneInfo("Asia/Shanghai")
-TODAY = datetime.now(TZ).strftime("%Y%m%d")
-TIMEOUT = 12
-
-session = requests.Session()
-session.headers.update({
-    "User-Agent": "Mozilla/5.0",
-    "Referer": "https://quote.eastmoney.com/"
-})
 
 
-# =========================================================
-# 基础
-# =========================================================
+app = FastAPI(title="妖股雷达", version="3.0")
 
-def get_json(url: str, params: Dict[str, Any]) -> Dict[str, Any]:
-    try:
-        r = session.get(url, params=params, timeout=TIMEOUT)
-        r.raise_for_status()
-        return r.json()
-    except Exception:
-        return {}
+
+
+EASTMONEY_QT = "https://push2.eastmoney.com/api/qt/stock/get"
+
+EASTMONEY_CLIST = "https://push2.eastmoney.com/api/qt/clist/get"
+
+EASTMONEY_KLINE = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
+
+EASTMONEY_LHB = "https://datacenter-web.eastmoney.com/api/data/v1/get"
+
+
+
+HEADERS = {
+
+    "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
+
+                  "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
+
+}
+
+
+
+# =========================
+
+# 基础工具
+
+# =========================
+
+
+
+def get_json(url: str, params: Dict[str, Any], timeout: int = 12) -> Dict[str, Any]:
+
+    r = requests.get(url, params=params, headers=HEADERS, timeout=timeout)
+
+    r.raise_for_status()
+
+    return r.json()
+
+
+
 
 
 def clean_code(code: str) -> str:
-    code = str(code or "").strip()
 
-    if "." in code:
-        code = code.split(".")[-1]
+    return str(code).strip().zfill(6)
 
-    return code.zfill(6)
 
 
-def normalize_date(date: str) -> str:
-    if not date:
-        return TODAY
 
-    date = date.replace("-", "").replace("/", "").strip()
 
-    if len(date) != 8 or not date.isdigit():
-        return TODAY
+def market_prefix(code: str) -> str:
 
-    return date
+    code = clean_code(code)
 
+    if code.startswith(("60", "68")):
 
-# =========================================================
-# 交易日
-# =========================================================
+        return "1"
 
-def get_trading_dates(
-    end_date: str,
-    count: int = 45
-) -> List[str]:
+    if code.startswith(("00", "30")):
 
-    url = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
+        return "0"
 
-    params = {
-        "secid": "1.000001",
-        "fields1": "f1,f2,f3,f4,f5,f6",
-        "fields2":
-            "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61",
-        "klt": "101",
-        "fqt": "1",
-        "beg": "0",
-        "end": end_date,
-        "lmt": str(count)
-    }
-
-    data = get_json(url, params)
-
-    rows = data.get("data", {}).get("klines", [])
-
-    dates = []
-
-    for row in rows:
-        try:
-            dates.append(
-                row.split(",")[0].replace("-", "")
-            )
-        except Exception:
-            pass
-
-    return dates
-
-
-def actual_target_date(date: str) -> str:
-
-    dates = get_trading_dates(date, 10)
-
-    if dates:
-        return dates[-1]
-
-    return date
-
-
-# =========================================================
-# 股票列表
-# =========================================================
-
-def get_stock_list() -> List[Dict[str, Any]]:
-
-    url = "https://push2.eastmoney.com/api/qt/clist/get"
-
-    params = {
-        "pn": "1",
-        "pz": "6000",
-        "po": "1",
-        "np": "1",
-        "fltt": "2",
-        "invt": "2",
-        "fid": "f3",
-        "fs":
-            "m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23",
-        "fields":
-            "f2,f3,f8,f12,f14,f20,f21"
-    }
-
-    data = get_json(url, params)
-
-    diff = data.get("data", {}).get("diff", [])
-
-    result = []
-
-    for x in diff:
-
-        code = clean_code(x.get("f12", ""))
-
-        if not code:
-            continue
-
-        # 排除明显非A股代码
-        if not (
-            code.startswith(("000", "001", "002",
-                              "003", "300", "301",
-                              "600", "601", "603",
-                              "605", "688", "689"))
-        ):
-            continue
-
-        result.append({
-            "code": code,
-            "name": x.get("f14", ""),
-            "price": float(x.get("f2") or 0),
-            "pct": float(x.get("f3") or 0),
-            "turnover": float(x.get("f8") or 0),
-            "market_cap":
-                float(x.get("f20") or 0) / 1e8
-        })
-
-    return result
-
-
-# =========================================================
-# K线
-# =========================================================
-
-def get_kline(
-    code: str,
-    end_date: str,
-    limit: int = 45
-) -> List[Dict[str, Any]]:
-
-    market = "1" if code.startswith(
-        ("6", "68")
-    ) else "0"
-
-    secid = f"{market}.{code}"
-
-    url = (
-        "https://push2his.eastmoney.com/"
-        "api/qt/stock/kline/get"
-    )
-
-    params = {
-        "secid": secid,
-        "fields1": "f1,f2,f3,f4,f5,f6",
-        "fields2":
-            "f51,f52,f53,f54,f55,f56,"
-            "f57,f58,f59,f60,f61",
-        "klt": "101",
-        "fqt": "1",
-        "beg": "0",
-        "end": end_date,
-        "lmt": str(limit)
-    }
-
-    data = get_json(url, params)
-
-    rows = data.get("data", {}).get("klines", [])
-
-    result = []
-
-    for row in rows:
-
-        try:
-
-            p = row.split(",")
-
-            result.append({
-                "date": p[0].replace("-", ""),
-                "open": float(p[1]),
-                "close": float(p[2]),
-                "high": float(p[3]),
-                "low": float(p[4]),
-                "volume": float(p[5]),
-                "amount": float(p[6]),
-                "amplitude": float(p[7]),
-                "pct": float(p[8]),
-                "change": float(p[9]),
-                "turnover": float(p[10])
-            })
-
-        except Exception:
-            continue
-
-    return result
-
-
-# =========================================================
-# 龙虎榜
-# =========================================================
-
-def get_lhb(target_date: str) -> Dict[str, Dict[str, Any]]:
-
-    url = (
-        "https://datacenter-web.eastmoney.com/"
-        "api/data/v1/get"
-    )
-
-    date_fmt = (
-        f"{target_date[:4]}-"
-        f"{target_date[4:6]}-"
-        f"{target_date[6:]}"
-    )
-
-    params = {
-        "reportName":
-            "RPT_DAILYBILLBOARD_DETAILSNEW",
-
-        "columns":
-            "SECURITY_CODE,SECURITY_NAME_ABBR,"
-            "BILLBOARD_NET_AMT,"
-            "BILLBOARD_BUY_AMT,"
-            "BILLBOARD_SELL_AMT,"
-            "TRADE_DATE",
-
-        "filter":
-            f"(TRADE_DATE='{date_fmt}')",
-
-        "pageNumber": "1",
-        "pageSize": "500",
-        "sortColumns": "BILLBOARD_NET_AMT",
-        "sortTypes": "-1"
-    }
-
-    data = get_json(url, params)
-
-    rows = (
-        data.get("result", {})
-        .get("data", [])
-        or []
-    )
-
-    result = {}
-
-    for x in rows:
-
-        code = clean_code(
-            x.get("SECURITY_CODE", "")
-        )
-
-        if not code:
-            continue
-
-        result[code] = {
-            "name":
-                x.get("SECURITY_NAME_ABBR", ""),
-
-            "net":
-                float(x.get("BILLBOARD_NET_AMT") or 0),
-
-            "buy":
-                float(x.get("BILLBOARD_BUY_AMT") or 0),
-
-            "sell":
-                float(x.get("BILLBOARD_SELL_AMT") or 0)
-        }
-
-    return result
-
-
-# =========================================================
-# 涨停判断
-# =========================================================
-
-def is_limit_up(
-    row: Dict[str, Any],
-    code: str
-) -> bool:
-
-    pct = row.get("pct", 0)
-
-    # 创业板 / 科创板
-    if code.startswith(("300", "301", "688", "689")):
-        return pct >= 19.5
-
-    # 北交所
     if code.startswith(("8", "4")):
-        return pct >= 29
 
-    # 主板
-    return pct >= 9.5
+        return "0"
 
+    return "1"
 
-# =========================================================
-# 五项硬条件
-# =========================================================
 
-def calculate_hard_conditions(
-    code: str,
-    kline: List[Dict[str, Any]]
-) -> Dict[str, Any]:
 
-    if len(kline) < 30:
 
-        return {
-            "valid": False,
-            "reason": "K线不足30日"
-        }
 
-    last = kline[-1]
+def secid(code: str) -> str:
 
-    closes = [
-        x["close"]
-        for x in kline
-    ]
+    return f"{market_prefix(code)}.{clean_code(code)}"
 
-    volumes = [
-        x["volume"]
-        for x in kline
-    ]
 
-    # -----------------------------------------------------
-    # 硬条件1：连续5日上涨
-    # -----------------------------------------------------
 
-    last5 = kline[-5:]
 
-    five_up = all(
-        last5[i]["close"]
-        > last5[i - 1]["close"]
-        for i in range(1, 5)
-    )
 
-    # -----------------------------------------------------
-    # 硬条件2：30日内有过涨停
-    # -----------------------------------------------------
+def normalize_date(d: Optional[str]) -> str:
 
-    last30 = kline[-30:]
+    if not d:
 
-    zt30_count = sum(
-        1
-        for x in last30
-        if is_limit_up(x, code)
-    )
-
-    zt30 = zt30_count > 0
-
-    # -----------------------------------------------------
-    # 硬条件3：收盘不破5日线
-    # -----------------------------------------------------
-
-    ma5 = sum(closes[-5:]) / 5
-
-    above_ma5 = (
-        last["close"] >= ma5
-    )
-
-    # -----------------------------------------------------
-    # 硬条件4：堆量成交量
-    #
-    # 定义：
-    # 当日成交量 >= 前20日平均成交量 × 1.5
-    # -----------------------------------------------------
-
-    avg20_volume = (
-        sum(volumes[-21:-1]) / 20
-    )
-
-    if avg20_volume > 0:
-
-        volume_ratio = (
-            last["volume"]
-            / avg20_volume
-        )
-
-    else:
-
-        volume_ratio = 0
-
-    volume_stack = (
-        volume_ratio >= 1.5
-    )
-
-    # -----------------------------------------------------
-    # 硬条件5：底部筹码不动
-    #
-    # 使用公开K线进行可验证代理：
-    #
-    # 1. 最近10日最低价没有明显跌破
-    #    前20日低点
-    #
-    # 2. 最新收盘距离近期低点至少5%
-    #
-    # 3. 最近10日没有出现异常破位
-    # -----------------------------------------------------
-
-    previous20 = kline[-30:-10]
-
-    old_low = min(
-        x["low"]
-        for x in previous20
-    )
-
-    recent10 = kline[-10:]
-
-    recent10_low = min(
-        x["low"]
-        for x in recent10
-    )
-
-    no_break_bottom = (
-        recent10_low
-        >= old_low * 0.95
-    )
-
-    close_away_bottom = (
-        last["close"]
-        >= recent10_low * 1.05
-    )
-
-    bottom_stable = (
-        no_break_bottom
-        and close_away_bottom
-    )
-
-    hard = [
-        five_up,
-        zt30,
-        above_ma5,
-        volume_stack,
-        bottom_stable
-    ]
-
-    return {
-
-        "valid": True,
-
-        # 五项硬条件
-        "five_up": five_up,
-        "zt30": zt30,
-        "above_ma5": above_ma5,
-        "volume_stack": volume_stack,
-        "bottom_stable": bottom_stable,
-
-        "hard_count":
-            sum(1 for x in hard if x),
-
-        "hard": hard,
-
-        "zt30_count":
-            zt30_count,
-
-        "ma5":
-            ma5,
-
-        "volume_ratio":
-            volume_ratio,
-
-        "close":
-            last["close"],
-
-        "pct":
-            last["pct"],
-
-        "turnover":
-            last["turnover"]
-    }
-
-
-# =========================================================
-# 买卖时机提示
-# =========================================================
-
-def get_buy_sell_signals(
-    kline: List[Dict[str, Any]]
-) -> Dict[str, Any]:
-
-    if len(kline) < 10:
-
-        return {
-            "buy_signals": [],
-            "risk_signals": [],
-            "hold_signal": "",
-            "sell_signal": ""
-        }
-
-    last = kline[-1]
-    prev = kline[-2]
-
-    recent3 = kline[-3:]
-
-    buy_signals = []
-    risk_signals = []
-
-    # =====================================================
-    # 1. 援军战法
-    #
-    # 股价重挫后企稳：
-    # 前一日明显下跌
-    # 当前不再创新低
-    # 当前收盘重新走强
-    # =====================================================
-
-    rescue = (
-        prev["pct"] <= -3
-        and last["low"] >= prev["low"]
-        and last["close"] > prev["close"]
-    )
-
-    if rescue:
-        buy_signals.append(
-            "援军战法：重挫后企稳"
-        )
-
-    # =====================================================
-    # 2. 破位阴线
-    # =====================================================
-
-    ma5 = sum(
-        x["close"]
-        for x in kline[-5:]
-    ) / 5
-
-    breakdown = (
-        last["close"] < last["open"]
-        and last["close"] < ma5
-        and last["close"] < prev["low"]
-    )
-
-    if breakdown:
-        risk_signals.append(
-            "破位阴线：注意风险"
-        )
-
-    # =====================================================
-    # 3. 加速阴线
-    # =====================================================
-
-    acceleration = (
-        last["close"] < last["open"]
-        and last["pct"] <= -3
-        and last["volume"]
-        >= prev["volume"] * 1.3
-    )
-
-    if acceleration:
-        risk_signals.append(
-            "加速阴线：注意减仓"
-        )
-
-    # =====================================================
-    # 4. 反转阴线
-    #
-    # 当日收阴但下影明显，
-    # 且低点没有继续明显破位
-    # =====================================================
-
-    body = abs(
-        last["close"] - last["open"]
-    )
-
-    lower_shadow = (
-        min(last["open"], last["close"])
-        - last["low"]
-    )
-
-    reversal_yin = (
-        last["close"] < last["open"]
-        and lower_shadow > body * 1.5
-        and last["low"] >= prev["low"] * 0.98
-    )
-
-    if reversal_yin:
-        buy_signals.append(
-            "反转阴线：低位观察买点"
-        )
-
-    # =====================================================
-    # 5. 仙人指路
-    # =====================================================
-
-    upper_shadow = (
-        last["high"]
-        - max(last["open"], last["close"])
-    )
-
-    xianren = (
-        upper_shadow
-        >= body * 2
-        and last["close"] >= last["open"] * 0.98
-        and last["volume"] >= prev["volume"]
-    )
-
-    if xianren:
-        buy_signals.append(
-            "仙人指路：观察突破"
-        )
-
-    # =====================================================
-    # 6. 双剑合璧
-    #
-    # 这里采用量价确认：
-    # 收盘走强 + 成交量放大
-    # =====================================================
-
-    double_sword = (
-        last["close"] > prev["close"]
-        and last["volume"]
-        >= prev["volume"] * 1.2
-        and last["close"] >= last["open"]
-    )
-
-    if double_sword:
-        buy_signals.append(
-            "双剑合璧：量价配合"
-        )
-
-    # =====================================================
-    # 7. 倚天剑
-    #
-    # 强势突破近期高点
-    # =====================================================
-
-    recent_high = max(
-        x["high"]
-        for x in kline[-20:-1]
-    )
-
-    yitian = (
-        last["close"] > recent_high
-        and last["volume"] >=
-        sum(x["volume"] for x in kline[-5:-1]) / 4
-    )
-
-    if yitian:
-        buy_signals.append(
-            "倚天剑：突破近期高点"
-        )
-
-    # =====================================================
-    # 8. 屠龙刀
-    #
-    # 放量突破
-    # =====================================================
-
-    recent20_high = max(
-        x["high"]
-        for x in kline[-20:-1]
-    )
-
-    avg10_volume = (
-        sum(x["volume"] for x in kline[-11:-1])
-        / 10
-    )
-
-    tulong = (
-        last["close"] > recent20_high
-        and last["volume"] >= avg10_volume * 1.5
-    )
-
-    if tulong:
-        buy_signals.append(
-            "屠龙刀：放量突破"
-        )
-
-    # =====================================================
-    # 9. 九阴九阳
-    #
-    # 作为趋势提示，不作为硬条件
-    # =====================================================
-
-    last9 = kline[-9:]
-
-    up_days = sum(
-        1 for x in last9
-        if x["close"] > x["open"]
-    )
-
-    down_days = sum(
-        1 for x in last9
-        if x["close"] < x["open"]
-    )
-
-    if up_days >= 7:
-        buy_signals.append(
-            "九阴九阳：多方占优"
-        )
-
-    elif down_days >= 7:
-        risk_signals.append(
-            "九阴九阳：空方占优"
-        )
-
-    # =====================================================
-    # 持股 / 卖出规则
-    # =====================================================
-
-    if (
-        last["high"] > prev["high"]
-        and last["low"] > prev["low"]
-        and last["close"] > prev["close"]
-    ):
-        hold_signal = (
-            "持股：高点高、低点高、收盘高"
-        )
-    else:
-        hold_signal = ""
-
-    sell_reasons = []
-
-    if last["high"] <= prev["high"]:
-        sell_reasons.append(
-            "高点不创新高"
-        )
-
-    if last["close"] <= prev["close"]:
-        sell_reasons.append(
-            "收盘价不高于昨日"
-        )
-
-    if last["low"] <= prev["low"]:
-        sell_reasons.append(
-            "最低点不高于昨日最低点"
-        )
-
-    if sell_reasons:
-        sell_signal = (
-            "卖出观察：" +
-            "、".join(sell_reasons)
-        )
-    else:
-        sell_signal = ""
-
-    return {
-        "buy_signals": buy_signals,
-        "risk_signals": risk_signals,
-        "hold_signal": hold_signal,
-        "sell_signal": sell_signal
-    }
-
-
-# =========================================================
-# 综合评分
-#
-# 注意：
-# 评分只针对已经通过5项硬条件的股票
-# =========================================================
-
-def calculate_score(
-    indicators: Dict[str, Any],
-    lhb: Dict[str, Any]
-) -> float:
-
-    score = 0.0
-
-    # 3日涨停强度
-    score += min(
-        indicators.get("zt3_count", 0) * 15,
-        30
-    )
-
-    # 30日涨停次数
-    score += min(
-        indicators.get("zt30_count", 0) * 3,
-        15
-    )
-
-    # 堆量
-    score += min(
-        indicators.get("volume_ratio", 0) * 8,
-        20
-    )
-
-    # 龙虎榜净买
-    net = float(
-        lhb.get("net", 0)
-    )
-
-    if net > 0:
-        score += 15
-
-    # 涨幅
-    score += min(
-        max(indicators.get("pct", 0), 0) * 2,
-        10
-    )
-
-    # 换手
-    turnover = indicators.get(
-        "turnover", 0
-    )
-
-    if turnover >= 10:
-        score += 5
-
-    if turnover >= 20:
-        score += 5
-
-    return round(
-        min(score, 100),
-        1
-    )
-
-
-# =========================================================
-# 主扫描
-# =========================================================
-
-def build_scan(
-    requested_date: str
-) -> Dict[str, Any]:
-
-    target_date = actual_target_date(
-        requested_date
-    )
-
-    lhb = get_lhb(target_date)
-
-    stocks = get_stock_list()
-
-    results = []
-
-    for stock in stocks:
-
-        code = stock["code"]
-
-        # 市值作为评分/筛选范围
-        # 这里保留你之前要求的 <=300亿
-        market_cap = stock["market_cap"]
-
-        if market_cap <= 0 or market_cap > 300:
-            continue
-
-        kline = get_kline(
-            code,
-            target_date,
-            45
-        )
-
-        if len(kline) < 30:
-            continue
-
-        indicators = calculate_hard_conditions(
-            code,
-            kline
-        )
-
-        if not indicators["valid"]:
-            continue
-
-        # -------------------------------------------------
-        # 近3日涨停次数
-        # -------------------------------------------------
-
-        last3 = kline[-3:]
-
-        zt3_count = sum(
-            1
-            for x in last3
-            if is_limit_up(x, code)
-        )
-
-        indicators["zt3_count"] = zt3_count
-
-        # -------------------------------------------------
-        # 5项硬条件
-        # -------------------------------------------------
-
-        hard = [
-            indicators["five_up"],
-            indicators["zt30"],
-            indicators["above_ma5"],
-            indicators["volume_stack"],
-            indicators["bottom_stable"]
-        ]
-
-        hard_count = sum(
-            1 for x in hard if x
-        )
-
-        # -------------------------------------------------
-        # 必须5项全部满足
-        # -------------------------------------------------
-
-        if hard_count != 5:
-            continue
-
-        # -------------------------------------------------
-        # 龙虎榜只是评分依据
-        # -------------------------------------------------
-
-        lhb_item = lhb.get(
-            code,
-            {
-                "name": stock["name"],
-                "net": 0,
-                "buy": 0,
-                "sell": 0
-            }
-        )
-
-        score = calculate_score(
-            indicators,
-            lhb_item
-        )
-
-        # -------------------------------------------------
-        # 买卖提示
-        # -------------------------------------------------
-
-        signals = get_buy_sell_signals(
-            kline
-        )
-
-        results.append({
-
-            "code":
-                code,
-
-            "name":
-                stock["name"],
-
-            "market_cap":
-                round(market_cap, 2),
-
-            "price":
-                round(indicators["close"], 2),
-
-            "pct":
-                round(indicators["pct"], 2),
-
-            "turnover":
-                round(indicators["turnover"], 2),
-
-            # 五项硬条件
-            "five_up":
-                indicators["five_up"],
-
-            "zt30":
-                indicators["zt30_count"],
-
-            "above_ma5":
-                indicators["above_ma5"],
-
-            "volume_stack":
-                indicators["volume_stack"],
-
-            "bottom_stable":
-                indicators["bottom_stable"],
-
-            "hard_count":
-                hard_count,
-
-            # 其他评分指标
-            "zt3":
-                zt3_count,
-
-            "volume_ratio":
-                round(
-                    indicators["volume_ratio"],
-                    2
-                ),
-
-            "lhb_net":
-                round(
-                    lhb_item["net"] / 1e8,
-                    2
-                ),
-
-            "lhb_buy":
-                round(
-                    lhb_item["buy"] / 1e8,
-                    2
-                ),
-
-            "lhb_sell":
-                round(
-                    lhb_item["sell"] / 1e8,
-                    2
-                ),
-
-            "lhb":
-                code in lhb,
-
-            "score":
-                score,
-
-            # 买卖提示
-            "buy_signals":
-                signals["buy_signals"],
-
-            "risk_signals":
-                signals["risk_signals"],
-
-            "hold_signal":
-                signals["hold_signal"],
-
-            "sell_signal":
-                signals["sell_signal"]
-        })
-
-        time.sleep(0.05)
-
-    # -----------------------------------------------------
-    # 综合评分排名
-    # -----------------------------------------------------
-
-    results.sort(
-        key=lambda x: (
-            x["score"],
-            x["lhb_net"],
-            x["zt3"],
-            x["pct"]
-        ),
-        reverse=True
-    )
-
-    return {
-
-        "requested_date":
-            requested_date,
-
-        "date":
-            target_date,
-
-        "hard_count":
-            len(results),
-
-        "top3":
-            results[:3],
-
-        "ranking":
-            results,
-
-        "source":
-            "东方财富公开行情接口",
-
-        "note":
-            "5项为硬条件；买卖时机、持股和卖出仅作为提示。"
-    }
-
-
-# =========================================================
-# API
-# =========================================================
-
-@app.get("/api/scanner")
-def scanner(
-    date: Optional[str] = Query(default="")
-):
-
-    requested_date = normalize_date(date)
-
-    if requested_date > TODAY:
-        requested_date = TODAY
+        return datetime.now(ZoneInfo("Asia/Shanghai")).strftime("%Y-%m-%d")
 
     try:
 
-        return build_scan(
-            requested_date
+        return datetime.strptime(d[:10], "%Y-%m-%d").strftime("%Y-%m-%d")
+
+    except Exception:
+
+        return datetime.now(ZoneInfo("Asia/Shanghai")).strftime("%Y-%m-%d")
+
+
+
+
+
+def get_trading_dates(end_date: str, days: int = 70) -> List[str]:
+
+    # 使用上证指数判断交易日：1.000001
+
+    end_date = normalize_date(end_date)
+
+    start = (
+
+        datetime.strptime(end_date, "%Y-%m-%d") - timedelta(days=days)
+
+    ).strftime("%Y-%m-%d")
+
+
+
+    data = get_json(
+
+        EASTMONEY_KLINE,
+
+        {
+
+            "secid": "1.000001",
+
+            "klt": 101,
+
+            "fqt": 1,
+
+            "beg": start.replace("-", ""),
+
+            "end": end_date.replace("-", ""),
+
+            "fields1": "f1,f2,f3,f4,f5,f6",
+
+            "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61",
+
+        },
+
+    )
+
+    rows = (data.get("data") or {}).get("klines") or []
+
+    return [x.split(",")[0] for x in rows]
+
+
+
+
+
+def actual_target_date(date_str: Optional[str]) -> str:
+
+    target = normalize_date(date_str)
+
+    dates = get_trading_dates(target, 90)
+
+    if dates:
+
+        return dates[-1]
+
+    return target
+
+
+
+
+
+# =========================
+
+# 行情 / K线 / 龙虎榜
+
+# =========================
+
+
+
+def get_stock_list(limit: int = 1200) -> List[Dict[str, Any]]:
+
+    """
+
+    当前股票池。
+
+    market_cap 单位：亿元。
+
+    为控制东方财富公开接口压力，先用当前行情筛选，再对候选做历史K线计算。
+
+    """
+
+    all_rows = []
+
+    pages = max(1, math.ceil(limit / 500))
+
+
+
+    for page in range(1, pages + 1):
+
+        data = get_json(
+
+            EASTMONEY_CLIST,
+
+            {
+
+                "pn": page,
+
+                "pz": 500,
+
+                "po": 1,
+
+                "np": 1,
+
+                "fltt": 2,
+
+                "invt": 2,
+
+                "fid": "f3",
+
+                "fs": "m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23",
+
+                "fields": "f2,f3,f8,f12,f14,f20,f21",
+
+            },
+
         )
+
+        diff = (data.get("data") or {}).get("diff") or []
+
+        if not diff:
+
+            break
+
+
+
+        for x in diff:
+
+            code = clean_code(x.get("f12", ""))
+
+            name = str(x.get("f14", ""))
+
+            cap = float(x.get("f20") or 0) / 1e8
+
+            pct = float(x.get("f3") or 0)
+
+            turnover = float(x.get("f8") or 0)
+
+
+
+            if not code or "ST" in name.upper() or "退" in name:
+
+                continue
+
+            if cap <= 0 or cap > 300:
+
+                continue
+
+
+
+            all_rows.append({
+
+                "code": code,
+
+                "name": name,
+
+                "market_cap": round(cap, 2),
+
+                "pct": pct,
+
+                "turnover": turnover,
+
+            })
+
+
+
+        if len(all_rows) >= limit:
+
+            break
+
+        time.sleep(0.15)
+
+
+
+    # 优先活跃股票，降低请求量
+
+    all_rows.sort(key=lambda x: (x["pct"], x["turnover"]), reverse=True)
+
+    return all_rows[:limit]
+
+
+
+
+
+def get_kline(code: str, beg: str, end: str) -> List[Dict[str, float]]:
+
+    data = get_json(
+
+        EASTMONEY_KLINE,
+
+        {
+
+            "secid": secid(code),
+
+            "klt": 101,
+
+            "fqt": 1,
+
+            "beg": beg.replace("-", ""),
+
+            "end": end.replace("-", ""),
+
+            "fields1": "f1,f2,f3,f4,f5,f6",
+
+            "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61",
+
+        },
+
+    )
+
+    rows = (data.get("data") or {}).get("klines") or []
+
+    out = []
+
+
+
+    for row in rows:
+
+        p = row.split(",")
+
+        if len(p) < 11:
+
+            continue
+
+        try:
+
+            out.append({
+
+                "date": p[0],
+
+                "open": float(p[1]),
+
+                "close": float(p[2]),
+
+                "high": float(p[3]),
+
+                "low": float(p[4]),
+
+                "volume": float(p[5]),
+
+                "amount": float(p[6]),
+
+                "amplitude": float(p[7]),
+
+                "pct": float(p[8]),
+
+                "change": float(p[9]),
+
+                "turnover": float(p[10]),
+
+            })
+
+        except Exception:
+
+            continue
+
+
+
+    return out
+
+
+
+
+
+def get_lhb(target_date: str) -> Dict[str, Dict[str, float]]:
+
+    """
+
+    东方财富历史龙虎榜。
+
+    """
+
+    result = {}
+
+    try:
+
+        data = get_json(
+
+            EASTMONEY_LHB,
+
+            {
+
+                "reportName": "RPT_DAILYBILLBOARD_DETAILSNEW",
+
+                "columns": "ALL",
+
+                "filter": f"(TRADE_DATE='{target_date}')",
+
+                "pageNumber": 1,
+
+                "pageSize": 500,
+
+                "sortColumns": "BILLBOARD_NET_AMT",
+
+                "sortTypes": "-1",
+
+            },
+
+        )
+
+
+
+        rows = (data.get("result") or {}).get("data") or []
+
+        for x in rows:
+
+            code = clean_code(x.get("SECURITY_CODE", ""))
+
+            if not code:
+
+                continue
+
+            result[code] = {
+
+                "net": float(x.get("BILLBOARD_NET_AMT") or 0) / 1e4,
+
+                "buy": float(x.get("BILLBOARD_BUY_AMT") or 0) / 1e4,
+
+                "sell": float(x.get("BILLBOARD_SELL_AMT") or 0) / 1e4,
+
+            }
+
+    except Exception:
+
+        pass
+
+    return result
+
+
+
+
+
+# =========================
+
+# 五条硬条件
+
+# =========================
+
+
+
+HARD_NAMES = [
+
+    "①连续5日上涨",
+
+    "②30日内有过涨停",
+
+    "③收盘价不破5日线",
+
+    "④成交量堆量",
+
+    "⑤底部筹码不动",
+
+]
+
+
+
+
+
+def is_limit_up(row: Dict[str, float]) -> bool:
+
+    # 普通A股近似涨停判断。
+
+    # ST/特殊股票已在股票池中排除。
+
+    return row["pct"] >= 9.7
+
+
+
+
+
+def calc_hard_conditions(k: List[Dict[str, float]]) -> List[bool]:
+
+    if len(k) < 35:
+
+        return [False] * 5
+
+
+
+    last = k[-1]
+
+
+
+    # ① 连续5日上涨：最近5根收盘价逐日上涨
+
+    five_up = all(k[i]["close"] > k[i - 1]["close"] for i in range(len(k) - 4, len(k)))
+
+
+
+    # ② 30日内有过涨停
+
+    last30 = k[-30:]
+
+    zt30 = any(is_limit_up(x) for x in last30)
+
+
+
+    # ③ 收盘不破5日线
+
+    closes5 = [x["close"] for x in k[-5:]]
+
+    ma5 = sum(closes5) / 5
+
+    above_ma5 = last["close"] >= ma5 * 0.998
+
+
+
+    # ④ 成交量堆量：最近3日平均量 > 前5日平均量，且最近一天不明显缩量
+
+    recent3 = sum(x["volume"] for x in k[-3:]) / 3
+
+    prev5 = sum(x["volume"] for x in k[-8:-3]) / 5
+
+    volume_stack = recent3 >= prev5 * 1.15 and last["volume"] >= prev5 * 0.90
+
+
+
+    # ⑤ 底部筹码不动：
+
+    # 公开K线接口没有完整历史筹码分布，因此使用“底部区间低点稳定+
+
+    # 回撤较小+放量上涨”的透明K线代理，不伪造真实筹码数据。
+
+    look = k[-20:]
+
+    low20 = min(x["low"] for x in look)
+
+    recent_low = min(x["low"] for x in k[-5:])
+
+    chip_proxy = (
+
+        recent_low >= low20 * 0.97
+
+        and last["close"] >= low20 * 1.05
+
+        and recent3 >= prev5 * 0.90
+
+    )
+
+
+
+    return [five_up, zt30, above_ma5, volume_stack, chip_proxy]
+
+
+
+
+
+# =========================
+
+# 买点 / 持有 / 卖点规则
+
+# =========================
+
+
+
+def candle_body(row):
+
+    return abs(row["close"] - row["open"])
+
+
+
+
+
+def get_signals(k: List[Dict[str, float]]) -> Dict[str, Any]:
+
+    if len(k) < 12:
+
+        return {
+
+            "buy": [],
+
+            "hold": [],
+
+            "sell": [],
+
+            "rules": [],
+
+        }
+
+
+
+    a = k[-1]
+
+    b = k[-2]
+
+    c = k[-3]
+
+
+
+    buy = []
+
+    hold = []
+
+    sell = []
+
+    rules = []
+
+
+
+    # 援军战法：重挫后止跌，不再创新低
+
+    recent = k[-8:]
+
+    drop = max(x["high"] for x in recent[:-2]) > a["close"] * 1.08
+
+    stabilized = a["low"] >= min(x["low"] for x in recent[:-2]) and a["close"] > a["open"]
+
+    if drop and stabilized:
+
+        buy.append("援军战法")
+
+        rules.append("援军战法")
+
+
+
+    # 三种阴线
+
+    if a["close"] < a["open"]:
+
+        body = candle_body(a)
+
+        prev_body = max(candle_body(b), 0.0001)
+
+
+
+        if a["close"] < min(b["low"], c["low"]):
+
+            rules.append("破位阴")
+
+        elif body > prev_body * 1.5:
+
+            rules.append("加速阴")
+
+        else:
+
+            rules.append("反转阴")
+
+
+
+        # 反转阴低点附近作为潜在买点
+
+        if "反转阴" in rules and a["close"] >= a["low"] * 1.005:
+
+            buy.append("反转阴低点附近")
+
+
+
+    # 九阴九阳：最近9日多空交替/阳线占优的简化K线代理
+
+    last9 = k[-9:]
+
+    bull9 = sum(1 for x in last9 if x["close"] > x["open"])
+
+    if bull9 >= 6:
+
+        rules.append("九阴九阳")
+
+
+
+    # 仙人指路：长上影、实体较小、收盘仍在前高附近
+
+    upper = a["high"] - max(a["open"], a["close"])
+
+    body = max(candle_body(a), 0.0001)
+
+    if upper >= body * 2 and a["close"] >= max(x["high"] for x in k[-6:-1]) * 0.97:
+
+        rules.append("仙人指路")
+
+
+
+    # 双剑合璧：连续两日明显放量且收盘抬高
+
+    if (
+
+        a["volume"] > b["volume"] * 1.15
+
+        and b["volume"] > c["volume"] * 1.05
+
+        and a["close"] > b["close"] > c["close"]
+
+    ):
+
+        rules.append("双剑合璧")
+
+
+
+    # 倚天剑：强势突破近20日高点
+
+    high20 = max(x["high"] for x in k[-21:-1])
+
+    if a["close"] > high20 and a["volume"] > sum(x["volume"] for x in k[-6:-1]) / 5:
+
+        rules.append("倚天剑")
+
+
+
+    # 屠龙刀：放量冲高后明显回落
+
+    if (
+
+        a["high"] >= high20 * 1.01
+
+        and a["close"] < a["high"] * 0.97
+
+        and a["volume"] > sum(x["volume"] for x in k[-6:-1]) / 5 * 1.3
+
+    ):
+
+        rules.append("屠龙刀")
+
+
+
+    # 三不高 / 三不低
+
+    high_higher = a["high"] > b["high"]
+
+    low_higher = a["low"] > b["low"]
+
+    close_higher = a["close"] > b["close"]
+
+
+
+    if high_higher and low_higher and close_higher:
+
+        hold.append("高点高 + 低点高 + 收盘价高")
+
+
+
+    # 卖点：按用户要求逐项识别
+
+    if a["high"] <= b["high"]:
+
+        sell.append("高点不创新高")
+
+    if a["close"] <= b["close"]:
+
+        sell.append("收盘价不高于昨日")
+
+    if a["low"] <= b["low"]:
+
+        sell.append("最低点不高于昨日最低点")
+
+
+
+    return {
+
+        "buy": buy,
+
+        "hold": hold,
+
+        "sell": sell,
+
+        "rules": list(dict.fromkeys(rules)),
+
+        "trend": {
+
+            "high_higher": high_higher,
+
+            "low_higher": low_higher,
+
+            "close_higher": close_higher,
+
+        },
+
+    }
+
+
+
+
+
+# =========================
+
+# 综合评分
+
+# =========================
+
+
+
+def score_stock(hard: List[bool], k: List[Dict[str, float]], lhb: Dict[str, float]) -> int:
+
+    """
+
+    评分100分。
+
+    5条硬条件是主体；买卖形态只作为加减分。
+
+    """
+
+    score = sum(hard) * 16
+
+
+
+    if not k:
+
+        return max(0, min(100, score))
+
+
+
+    last = k[-1]
+
+    prev5 = sum(x["volume"] for x in k[-6:-1]) / 5 if len(k) >= 6 else last["volume"]
+
+    if last["volume"] > prev5 * 1.5:
+
+        score += 8
+
+    elif last["volume"] > prev5 * 1.15:
+
+        score += 5
+
+
+
+    if last["pct"] >= 5:
+
+        score += 5
+
+    elif last["pct"] > 0:
+
+        score += 2
+
+
+
+    if lhb.get("net", 0) > 0:
+
+        score += 4
+
+    if lhb.get("net", 0) > 1000:
+
+        score += 3
+
+
+
+    sig = get_signals(k)
+
+    score += min(8, len(sig["buy"]) * 2)
+
+    score += min(5, len(sig["rules"]))
+
+
+
+    # 有明确卖出信号时适当扣分
+
+    score -= min(10, len(sig["sell"]) * 3)
+
+
+
+    return max(0, min(100, int(score)))
+
+
+
+
+
+# =========================
+
+# 单票计算
+
+# =========================
+
+
+
+def analyze_one(stock: Dict[str, Any], target_date: str, lhb_map: Dict[str, Dict[str, float]]):
+
+    code = stock["code"]
+
+    try:
+
+        end = datetime.strptime(target_date, "%Y-%m-%d")
+
+        beg = (end - timedelta(days=75)).strftime("%Y-%m-%d")
+
+        k = get_kline(code, beg, target_date)
+
+        if len(k) < 35:
+
+            return None
+
+
+
+        # 只使用截至目标日期的数据
+
+        k = [x for x in k if x["date"] <= target_date]
+
+        if len(k) < 35:
+
+            return None
+
+
+
+        hard = calc_hard_conditions(k)
+
+        count = sum(hard)
+
+
+
+        # 0~2 不进入展示
+
+        if count < 3:
+
+            return None
+
+
+
+        lhb = lhb_map.get(code, {
+
+            "net": 0.0,
+
+            "buy": 0.0,
+
+            "sell": 0.0,
+
+        })
+
+
+
+        sig = get_signals(k)
+
+        score = score_stock(hard, k, lhb)
+
+
+
+        missing = [
+
+            HARD_NAMES[i]
+
+            for i, ok in enumerate(hard)
+
+            if not ok
+
+        ]
+
+
+
+        if count == 5:
+
+            category = "strong"
+
+            category_text = "5/5 强势"
+
+        elif count == 4:
+
+            category = "near"
+
+            category_text = "4/5 高度接近"
+
+        else:
+
+            category = "observe"
+
+            category_text = "3/5 观察"
+
+
+
+        last = k[-1]
+
+        ma5 = sum(x["close"] for x in k[-5:]) / 5
+
+
+
+        return {
+
+            "code": code,
+
+            "name": stock["name"],
+
+            "market_cap": stock["market_cap"],
+
+            "pct": round(last["pct"], 2),
+
+            "close": round(last["close"], 2),
+
+            "turnover": round(last["turnover"], 2),
+
+            "ma5": round(ma5, 2),
+
+            "hard": hard,
+
+            "hard_count": count,
+
+            "category": category,
+
+            "category_text": category_text,
+
+            "missing_conditions": missing,
+
+            "missing_text": "、".join(missing) if missing else "无",
+
+            "zt30": any(is_limit_up(x) for x in k[-30:]),
+
+            "lhb": bool(code in lhb_map),
+
+            "lhb_net": round(lhb.get("net", 0), 2),
+
+            "lhb_buy": round(lhb.get("buy", 0), 2),
+
+            "lhb_sell": round(lhb.get("sell", 0), 2),
+
+            "score": score,
+
+            "signals": sig,
+
+            "data_note": "⑤底部筹码不动为公开K线代理判断",
+
+        }
+
+    except Exception:
+
+        return None
+
+
+
+
+
+def build_scan(target_date: Optional[str] = None):
+
+    target = actual_target_date(target_date)
+
+    lhb_map = get_lhb(target)
+
+    stocks = get_stock_list(1000)
+
+
+
+    results = []
+
+
+
+    # 控制东方财富请求压力
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+
+        futures = [
+
+            pool.submit(analyze_one, s, target, lhb_map)
+
+            for s in stocks
+
+        ]
+
+        for f in as_completed(futures):
+
+            try:
+
+                item = f.result()
+
+                if item:
+
+                    results.append(item)
+
+            except Exception:
+
+                pass
+
+
+
+    def rank_key(x):
+
+        return (
+
+            x["score"],
+
+            x["hard_count"],
+
+            x["lhb_net"],
+
+            x["zt30"],
+
+            x["pct"],
+
+        )
+
+
+
+    strong = sorted(
+
+        [x for x in results if x["category"] == "strong"],
+
+        key=rank_key, reverse=True
+
+    )
+
+    near = sorted(
+
+        [x for x in results if x["category"] == "near"],
+
+        key=rank_key, reverse=True
+
+    )
+
+    observe = sorted(
+
+        [x for x in results if x["category"] == "observe"],
+
+        key=rank_key, reverse=True
+
+    )
+
+
+
+    if strong:
+
+        top3 = strong[:3]
+
+        top3_type = "5/5 强势"
+
+        top3_note = "TOP 3来自5/5硬条件全部满足的强势池"
+
+    elif near:
+
+        top3 = near[:3]
+
+        top3_type = "4/5 替补"
+
+        top3_note = "今日暂无5/5，以下为4/5高度接近标的"
+
+    else:
+
+        top3 = observe[:3]
+
+        top3_type = "3/5 观察"
+
+        top3_note = "今日暂无5/5或4/5，以下仅供观察，不视为强势票"
+
+
+
+    ranking = sorted(
+
+        results,
+
+        key=lambda x: (x["hard_count"], x["score"], x["lhb_net"]),
+
+        reverse=True,
+
+    )
+
+
+
+    return {
+
+        "date": target,
+
+        "top3": top3,
+
+        "top3_type": top3_type,
+
+        "top3_note": top3_note,
+
+        "strong": strong[:30],
+
+        "near": near[:30],
+
+        "observe": observe[:30],
+
+        "ranking": ranking[:100],
+
+        "strong_count": len(strong),
+
+        "near_count": len(near),
+
+        "observe_count": len(observe),
+
+        "rules": HARD_NAMES,
+
+        "notice": "只有①②③④⑤是选股硬条件；买点、持有、卖点属于操作提示，不计入硬条件。",
+
+    }
+
+
+
+
+
+# =========================
+
+# API
+
+# =========================
+
+
+
+@app.get("/api/scanner")
+
+def scanner(date: Optional[str] = Query(default=None)):
+
+    try:
+
+        return build_scan(date)
 
     except Exception as e:
 
         return {
-            "requested_date":
-                requested_date,
 
-            "date":
-                requested_date,
+            "date": normalize_date(date),
 
-            "hard_count":
-                0,
+            "top3": [],
 
-            "top3":
-                [],
+            "top3_type": "暂无",
 
-            "ranking":
-                [],
+            "top3_note": "数据接口暂时不可用",
 
-            "error":
-                str(e)
+            "strong": [],
+
+            "near": [],
+
+            "observe": [],
+
+            "ranking": [],
+
+            "error": str(e),
+
         }
 
 
-# =========================================================
-# HTML
-# =========================================================
+
+
+
+# =========================
+
+# 手机端网页
+
+# =========================
+
+
 
 HTML = r"""
-<!DOCTYPE html>
+
+<!doctype html>
+
 <html lang="zh-CN">
 
 <head>
 
-<meta charset="UTF-8">
+<meta charset="utf-8">
 
-<meta name="viewport"
-content="width=device-width,
-initial-scale=1,
-maximum-scale=1,
-user-scalable=no">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">
 
 <title>妖股雷达</title>
 
 <style>
 
-*{
-    box-sizing:border-box;
-}
+*{box-sizing:border-box}
 
 body{
-    margin:0;
-    background:#07090f;
-    color:#f2f4f8;
-    font-family:
-    -apple-system,
-    BlinkMacSystemFont,
-    "PingFang SC",
-    "Microsoft YaHei",
-    Arial;
+
+ margin:0;background:#07090d;color:#eee;
+
+ font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",Arial,sans-serif;
+
 }
 
-.container{
-    max-width:900px;
-    margin:auto;
-    padding:16px;
+.wrap{max-width:900px;margin:auto;padding:14px}
+
+h1{font-size:24px;margin:4px 0}
+
+.sub{color:#8f98a8;font-size:13px;margin-bottom:14px}
+
+.toolbar{display:flex;gap:8px;margin-bottom:12px}
+
+input,button{
+
+ border:1px solid #252b36;background:#11151c;color:#fff;
+
+ border-radius:8px;padding:10px 12px;font-size:14px
+
 }
 
-.header{
-    display:flex;
-    justify-content:space-between;
-    align-items:center;
-    margin-bottom:18px;
-}
+button{cursor:pointer}
 
-.logo{
-    font-size:28px;
-    font-weight:900;
-}
-
-.logo span{
-    color:#ff3030;
-}
-
-.source{
-    color:#8e97a8;
-    font-size:12px;
-}
+button:hover{background:#181e27}
 
 .card{
-    background:#11151e;
-    border:1px solid #252d3d;
-    border-radius:18px;
-    padding:16px;
-    margin-bottom:16px;
+
+ background:#0d1117;border:1px solid #202733;border-radius:12px;
+
+ padding:13px;margin:10px 0
+
 }
 
-input{
-    width:100%;
-    padding:15px;
-    border-radius:14px;
-    border:1px solid #3a4356;
-    background:#080a10;
-    color:white;
-    font-size:18px;
-    text-align:center;
-}
+.rules{display:grid;grid-template-columns:1fr 1fr;gap:8px}
 
-button{
-    width:100%;
-    padding:14px;
-    margin-top:10px;
-    border:0;
-    border-radius:14px;
-    font-size:17px;
-    font-weight:800;
-}
+.rule{padding:10px;background:#11161e;border-radius:8px;font-size:13px}
 
-.search{
-    background:#ed3030;
-    color:white;
-}
+.notice{color:#9aa5b5;font-size:12px;line-height:1.6}
 
-.today{
-    background:#273144;
-    color:white;
-}
+.title{font-size:18px;font-weight:700;margin-bottom:10px}
 
-.section-title{
-    font-size:23px;
-    font-weight:900;
-    margin:24px 0 12px;
-}
+.topnote{font-size:12px;color:#ffb15c;margin-bottom:10px}
 
-.hard{
-    line-height:1.9;
-    color:#c4cbd8;
-}
-
-.hard b{
-    color:white;
-}
-
-.warning{
-    background:#141923;
-    border-left:4px solid #ff3b3b;
-    padding:13px;
-    border-radius:10px;
-    color:#aab2c0;
-    font-size:13px;
-    line-height:1.7;
-}
+.grid{display:grid;grid-template-columns:1fr;gap:10px}
 
 .stock{
-    background:#121722;
-    border:1px solid #293243;
-    border-radius:17px;
-    padding:16px;
-    margin-bottom:13px;
+
+ background:#11161e;border:1px solid #252d39;border-radius:10px;padding:12px
+
 }
 
-.stock-head{
-    display:flex;
-    justify-content:space-between;
-}
+.stockhead{display:flex;justify-content:space-between;gap:10px}
 
-.name{
-    font-size:21px;
-    font-weight:900;
-}
+.name{font-size:17px;font-weight:700}
 
-.code{
-    color:#8e97a7;
-    font-size:12px;
-    margin-top:4px;
-}
+.code{color:#7e899a;font-size:12px}
 
-.score{
-    color:#ff4545;
-    font-size:26px;
-    font-weight:900;
-}
+.score{font-size:21px;font-weight:800}
 
-.meta{
-    display:grid;
-    grid-template-columns:
-    repeat(2,1fr);
-    gap:7px;
-    margin-top:12px;
-}
+.badge{display:inline-block;padding:3px 7px;border-radius:5px;font-size:11px;margin-top:5px}
 
-.meta div{
-    background:#1b2130;
-    padding:8px;
-    border-radius:8px;
-    font-size:12px;
-    color:#b7bfce;
-}
+.red{background:#4a1418;color:#ff6974}
+
+.orange{background:#493117;color:#ffb35e}
+
+.yellow{background:#49410e;color:#f4dc64}
+
+.row{font-size:13px;line-height:1.75;color:#c6ccd6}
+
+.good{color:#ff4d5c}
+
+.ok{color:#55d6a2}
+
+.warn{color:#ffbd55}
+
+.gray{color:#818b9b}
+
+.missing{color:#ff8f68;font-size:12px;margin-top:4px}
 
 .signal{
-    margin-top:12px;
-    padding:11px;
-    border-radius:10px;
-    background:#171d2a;
-    line-height:1.8;
-    font-size:13px;
+
+ margin-top:8px;padding:8px;background:#0b0f15;border-radius:7px;
+
+ font-size:12px;line-height:1.7
+
 }
 
-.signal-title{
-    font-weight:900;
-    margin-bottom:4px;
-}
+.signal b{color:#fff}
 
-.buy{
-    color:#37dc98;
-}
+table{width:100%;border-collapse:collapse;font-size:12px}
 
-.risk{
-    color:#ff5555;
-}
+th,td{padding:8px 5px;border-bottom:1px solid #202733;text-align:left}
 
-.hold{
-    color:#45c7ff;
-}
+th{color:#8994a4}
 
-.sell{
-    color:#ff9d42;
-}
+.green{color:#4ee39b}
 
-.empty{
-    text-align:center;
-    color:#818a9b;
-    padding:35px 10px;
-}
+.redtxt{color:#ff5965}
 
-table{
-    width:100%;
-    border-collapse:collapse;
-    font-size:12px;
-}
+.footer{color:#667180;font-size:11px;margin:18px 0;text-align:center}
 
-th,td{
-    padding:10px 4px;
-    border-bottom:1px solid #272e3b;
-    text-align:center;
-}
-
-th{
-    color:#8992a3;
-}
-
-.red{
-    color:#ff5151;
-}
-
-.green{
-    color:#36d996;
-}
-
-.footer{
-    color:#616a7a;
-    text-align:center;
-    font-size:12px;
-    line-height:1.8;
-    margin:30px 0;
-}
+@media(min-width:700px){.grid{grid-template-columns:repeat(3,1fr)}}
 
 </style>
 
@@ -1365,520 +1376,370 @@ th{
 
 <body>
 
-<div class="container">
+<div class="wrap">
 
-<div class="header">
+ <h1>🔥 妖股雷达</h1>
 
-<div class="logo">
-妖股<span>雷达</span>
-</div>
-
-<div class="source">
-东方财富
-</div>
-
-</div>
+ <div class="sub">5条硬条件 + 买点/持有/卖点规则 · 东方财富公开行情数据</div>
 
 
-<div class="card">
 
-<input
-id="date"
-type="date"
->
+ <div class="toolbar">
 
-<button
-class="search"
-onclick="loadData()">
-查询
-</button>
+   <input id="date" type="date">
 
-<button
-class="today"
-onclick="setToday()">
-今天
-</button>
+   <button onclick="loadData()">开始扫描</button>
 
-</div>
+ </div>
 
 
-<div class="card hard">
 
-<b>🔴 5项核心硬条件</b><br>
+ <div class="card">
 
-① 连续5日上涨<br>
+   <div class="title">一、选股条件</div>
 
-② 30日内有过涨停<br>
+   <div class="rules">
 
-③ 收盘不破5日线<br>
+     <div class="rule">① 连续5日上涨</div>
 
-④ 堆量成交量<br>
+     <div class="rule">② 30日内有过涨停</div>
 
-⑤ 底部筹码不动
+     <div class="rule">③ 收盘价不破5日线</div>
 
-<br><br>
+     <div class="rule">④ 成交量堆量</div>
 
-<b>说明：</b>
+     <div class="rule">⑤ 底部筹码不动</div>
 
-以上5项必须全部满足，
-才进入强势候选池。
+   </div>
 
-</div>
+   <div class="notice" style="margin-top:9px">
 
+     只有以上5条属于硬条件。⑤使用公开K线做代理判断，不能等同于券商真实筹码分布。
 
-<div class="warning">
+   </div>
 
-⚠️ 买卖时机、持股和卖出规则
-只作为操作提示，不作为选股硬条件。
-
-<br>
-
-历史日期不伪造历史集合竞价数据。
-
-</div>
+ </div>
 
 
-<div class="section-title">
-🔥 强势 TOP3
-</div>
 
-<div id="top3"></div>
+ <div class="card">
 
+   <div class="title">🔥 TOP 3 强势票</div>
 
-<div class="section-title">
-📊 综合评分排行
-</div>
+   <div id="topNote" class="topnote">正在扫描……</div>
 
-<div class="card">
+   <div id="top3" class="grid"></div>
 
-<table>
-
-<thead>
-
-<tr>
-
-<th>股票</th>
-<th>市值</th>
-<th>3日涨停</th>
-<th>龙虎榜</th>
-<th>评分</th>
-
-</tr>
-
-</thead>
-
-<tbody id="ranking"></tbody>
-
-</table>
-
-</div>
+ </div>
 
 
-<div class="footer">
 
-数据来源：东方财富公开行情接口<br>
+ <div class="card">
 
-5项硬条件 + 综合评分 + 买卖操作提示<br>
+   <div class="title">🔴 5/5 强势池</div>
 
-本工具仅用于信息整理与量化筛选，不构成投资建议
+   <div id="strong" class="grid"></div>
+
+ </div>
+
+
+
+ <div class="card">
+
+   <div class="title">🟠 4/5 高度接近</div>
+
+   <div id="near" class="grid"></div>
+
+ </div>
+
+
+
+ <div class="card">
+
+   <div class="title">🟡 3/5 观察池</div>
+
+   <div id="observe" class="grid"></div>
+
+ </div>
+
+
+
+ <div class="card">
+
+   <div class="title">📊 综合评分排行</div>
+
+   <div style="overflow:auto">
+
+   <table>
+
+    <thead>
+
+     <tr><th>股票</th><th>条件</th><th>市值</th><th>涨停</th><th>龙虎榜</th><th>评分</th></tr>
+
+    </thead>
+
+    <tbody id="ranking"></tbody>
+
+   </table>
+
+   </div>
+
+ </div>
+
+
+
+ <div class="footer">仅用于量化研究，不构成投资建议。</div>
 
 </div>
 
-</div>
 
 
 <script>
 
-function money(v){
+function esc(s){
 
-    v = Number(v || 0);
+ return String(s ?? '').replace(/[&<>"']/g,m=>({
 
-    if(Math.abs(v) >= 1){
+  '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'
 
-        return v.toFixed(2) + "亿";
+ }[m]));
 
-    }
-
-    return Math.round(v * 10000) + "万";
 }
 
 
-function signalsHtml(r){
 
-    let html = "";
+function badge(r){
 
+ let cls = r.hard_count===5?'red':(r.hard_count===4?'orange':'yellow');
 
-    if(r.buy_signals &&
-       r.buy_signals.length){
+ return `<span class="badge ${cls}">${esc(r.category_text)}</span>`;
 
-        html += `
-        <div class="signal buy">
-        <div class="signal-title">
-        🟢 买卖时机提示
-        </div>
-        ${r.buy_signals.join("<br>")}
-        </div>
-        `;
-
-    }
-
-
-    if(r.risk_signals &&
-       r.risk_signals.length){
-
-        html += `
-        <div class="signal risk">
-        <div class="signal-title">
-        🔴 风险提示
-        </div>
-        ${r.risk_signals.join("<br>")}
-        </div>
-        `;
-
-    }
-
-
-    if(r.hold_signal){
-
-        html += `
-        <div class="signal hold">
-        <div class="signal-title">
-        🔵 持股提示
-        </div>
-        ${r.hold_signal}
-        </div>
-        `;
-
-    }
-
-
-    if(r.sell_signal){
-
-        html += `
-        <div class="signal sell">
-        <div class="signal-title">
-        🟠 卖出规则提示
-        </div>
-        ${r.sell_signal}
-        </div>
-        `;
-
-    }
-
-
-    if(!html){
-
-        html = `
-        <div class="signal">
-        当前没有明显的买卖/持股信号
-        </div>
-        `;
-
-    }
-
-
-    return html;
 }
 
 
-function renderTop3(rows){
 
-    const box =
-        document.getElementById("top3");
+function checkHard(r){
 
+ return r.hard.map((v,i)=>
 
-    if(!rows ||
-       rows.length === 0){
+   `<div class="row">${v?'<span class="ok">✓</span>':'<span class="gray">×</span>'} ${esc(['连续5日上涨','30日内有过涨停','收盘价不破5日线','成交量堆量','底部筹码不动'][i])}</div>`
 
-        box.innerHTML = `
-        <div class="empty">
-        当前日期没有股票同时满足5项硬条件
-        </div>
-        `;
+ ).join('');
 
-        return;
-    }
-
-
-    box.innerHTML = rows.map(
-        (r,i)=>`
-
-        <div class="stock">
-
-        <div class="stock-head">
-
-        <div>
-
-        <div class="name">
-        ${i+1}. ${r.name}
-        </div>
-
-        <div class="code">
-        ${r.code}
-        </div>
-
-        </div>
-
-        <div class="score">
-        ${r.score}
-        </div>
-
-        </div>
-
-
-        <div class="meta">
-
-        <div>
-        连续5日上涨：✅
-        </div>
-
-        <div>
-        30日涨停：${r.zt30}次
-        </div>
-
-        <div>
-        不破5日线：✅
-        </div>
-
-        <div>
-        堆量：${r.volume_ratio}倍
-        </div>
-
-        <div>
-        底部筹码：稳定
-        </div>
-
-        <div>
-        近3日涨停：${r.zt3}次
-        </div>
-
-        <div>
-        龙虎榜：${r.lhb ? "有" : "无"}
-        </div>
-
-        <div>
-        市值：${r.market_cap}亿
-        </div>
-
-        </div>
-
-
-        ${signalsHtml(r)}
-
-        </div>
-
-        `
-    ).join("");
 }
+
+
+
+function signalBlock(r){
+
+ const s=r.signals||{};
+
+ const buy=(s.buy||[]).length?s.buy.join('、'):'暂无明确买点';
+
+ const hold=(s.hold||[]).length?s.hold.join('、'):'暂无持有确认';
+
+ const sell=(s.sell||[]).length?s.sell.join('、'):'暂无卖点';
+
+ const rules=(s.rules||[]).length?s.rules.join('、'):'暂无形态规则';
+
+
+
+ return `
+
+ <div class="signal">
+
+   <div><b>🟢 买点：</b><span class="${(s.buy||[]).length?'ok':'gray'}">${esc(buy)}</span></div>
+
+   <div><b>🟡 持有：</b><span class="${(s.hold||[]).length?'ok':'gray'}">${esc(hold)}</span></div>
+
+   <div><b>🔴 卖点：</b><span class="${(s.sell||[]).length?'redtxt':'gray'}">${esc(sell)}</span></div>
+
+   <div><b>⚡ 触发规则：</b><span class="warn">${esc(rules)}</span></div>
+
+ </div>`;
+
+}
+
+
+
+function stockCard(r){
+
+ return `
+
+ <div class="stock">
+
+  <div class="stockhead">
+
+   <div>
+
+    <div class="name">${esc(r.name)}</div>
+
+    <div class="code">${esc(r.code)} · 市值 ${esc(r.market_cap)}亿</div>
+
+    ${badge(r)}
+
+   </div>
+
+   <div class="score">${esc(r.score)}<small style="font-size:11px">分</small></div>
+
+  </div>
+
+
+
+  <div class="row" style="margin-top:7px">
+
+   收盘 ${esc(r.close)}　
+
+   <span class="${r.pct>=0?'good':'redtxt'}">${r.pct>=0?'+':''}${esc(r.pct)}%</span>　
+
+   5日线 ${esc(r.ma5)}
+
+  </div>
+
+
+
+  <div style="margin-top:7px">${checkHard(r)}</div>
+
+
+
+  ${r.missing_text!=='无'
+
+    ? `<div class="missing">未满足：${esc(r.missing_text)}</div>`
+
+    : `<div class="row ok">✓ 5条硬条件全部满足</div>`}
+
+
+
+  ${signalBlock(r)}
+
+ </div>`;
+
+}
+
+
+
+function renderList(id, rows, empty){
+
+ const el=document.getElementById(id);
+
+ el.innerHTML=rows.length?rows.map(stockCard).join(''):
+
+ `<div class="notice">${esc(empty)}</div>`;
+
+}
+
+
+
+function renderTop3(rows,type,note){
+
+ document.getElementById('topNote').innerHTML =
+
+   `${esc(type)}　${esc(note)}`;
+
+ renderList('top3',rows,'今天没有满足展示条件的股票');
+
+}
+
 
 
 function renderRanking(rows){
 
-    const box =
-        document.getElementById("ranking");
+ const el=document.getElementById('ranking');
 
+ if(!rows.length){
 
-    if(!rows ||
-       rows.length === 0){
+   el.innerHTML='<tr><td colspan="6">暂无数据</td></tr>';
 
-        box.innerHTML = `
-        <tr>
-        <td colspan="5">
-        暂无满足5项硬条件的数据
-        </td>
-        </tr>
-        `;
+   return;
 
-        return;
-    }
+ }
 
+ el.innerHTML=rows.map(r=>`
 
-    box.innerHTML = rows.map(
-        r=>`
+  <tr>
 
-        <tr>
+   <td><b>${esc(r.name)}</b><br><span class="gray">${esc(r.code)}</span></td>
 
-        <td>
-        <b>${r.name}</b><br>
-        <small>${r.code}</small>
-        </td>
+   <td>${esc(r.hard_count)}/5</td>
 
-        <td>
-        ${r.market_cap}亿
-        </td>
+   <td>${esc(r.market_cap)}亿</td>
 
-        <td>
-        ${r.zt3}次
-        </td>
+   <td>${r.zt30?'有':'无'}</td>
 
-        <td class="${
-            r.lhb_net >= 0
-            ? "red"
-            : "green"
-        }">
-        ${money(r.lhb_net)}
-        </td>
+   <td class="${r.lhb_net>=0?'green':'redtxt'}">${r.lhb?'有':'无'} ${esc(r.lhb_net)}万</td>
 
-        <td class="red">
-        <b>${r.score}</b>
-        </td>
+   <td><b>${esc(r.score)}</b></td>
 
-        </tr>
+  </tr>
 
-        `
-    ).join("");
+ `).join('');
+
 }
+
 
 
 async function loadData(){
 
-    const input =
-        document.getElementById("date");
+ const d=document.getElementById('date').value;
 
-    const date =
-        input.value.replaceAll("-", "");
+ document.getElementById('topNote').textContent='正在扫描东方财富公开数据……';
 
+ try{
 
-    document.getElementById("top3").innerHTML =
-        `
-        <div class="empty">
-        正在扫描东方财富数据……
-        </div>
-        `;
+   const res=await fetch('/api/scanner?date='+encodeURIComponent(d));
+
+   const data=await res.json();
 
 
-    try{
 
-        const res =
-            await fetch(
-                "/api/scanner?date=" + date
-            );
+   if(data.error){
 
+     document.getElementById('topNote').textContent='数据接口错误：'+data.error;
 
-        const data =
-            await res.json();
+     return;
+
+   }
 
 
-        renderTop3(
-            data.top3 || []
-        );
 
+   document.getElementById('date').value=data.date;
 
-        renderRanking(
-            data.ranking || []
-        );
+   renderTop3(data.top3||[],data.top3_type||'暂无',data.top3_note||'');
 
+   renderList('strong',data.strong||[],'暂无5/5强势票');
 
-    }catch(e){
+   renderList('near',data.near||[],'暂无4/5高度接近票');
 
-        document.getElementById("top3").innerHTML =
-            `
-            <div class="empty">
-            数据加载失败，请稍后刷新
-            </div>
-            `;
+   renderList('observe',data.observe||[],'暂无3/5观察票');
 
-    }
+   renderRanking(data.ranking||[]);
+
+ }catch(e){
+
+   document.getElementById('topNote').textContent='加载失败：'+e;
+
+ }
 
 }
 
 
-function setToday(){
 
-    const d =
-        new Date();
+document.getElementById('date').value=new Date().toISOString().slice(0,10);
 
-
-    const y =
-        d.getFullYear();
-
-
-    const m =
-        String(
-            d.getMonth()+1
-        ).padStart(2,"0");
-
-
-    const day =
-        String(
-            d.getDate()
-        ).padStart(2,"0");
-
-
-    document.getElementById("date").value =
-        `${y}-${m}-${day}`;
-
-
-    loadData();
-
-}
-
-
-window.onload = function(){
-
-    const d =
-        new Date();
-
-
-    const y =
-        d.getFullYear();
-
-
-    const m =
-        String(
-            d.getMonth()+1
-        ).padStart(2,"0");
-
-
-    const day =
-        String(
-            d.getDate()
-        ).padStart(2,"0");
-
-
-    document.getElementById("date").value =
-        `${y}-${m}-${day}`;
-
-
-    loadData();
-
-};
+loadData();
 
 </script>
 
 </body>
+
 </html>
+
 """
 
 
-# =========================================================
-# 首页
-# =========================================================
 
-@app.get(
-    "/",
-    response_class=HTMLResponse
-)
+@app.get("/", response_class=HTMLResponse)
+
 def home():
 
     return HTML
-
-
-# =========================================================
-# 启动
-# =========================================================
-
-if __name__ == "__main__":
-
-    import uvicorn
-
-    uvicorn.run(
-        app,
-        host="0.0.0.0",
-        port=int(
-            os.environ.get(
-                "PORT",
-                10000
-            )
-        )
-    )
