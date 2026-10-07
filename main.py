@@ -1297,7 +1297,7 @@ function card(r,i){
 function render(){
   let l=RAW.slice();
   if(onlyFull) l=l.filter(r=>r.hard_full);
-  l.sort(sortMode==='score'?(a,b=>b.score-a.score):(a,b=>(b.lhb_net||0)-(a.lhb_net||0)));
+  l.sort(sortMode==='score'?(a,b)=>b.score-a.score:(a,b)=>(b.lhb_net||0)-(a.lhb_net||0));
   document.getElementById('out').innerHTML=l.length?l.map(card).join('')
     :'<div class="empty">暂无符合条件的股票<br>休市日或条件过严，可点右上刷新</div>';
 }
@@ -1422,7 +1422,7 @@ function compute(){
   (D?D.conds:[]).forEach(k=>counts[k]=0);
   rows.forEach(r=>{const res=cl(r,nh);const miss=[];
     Object.keys(res).forEach(k=>{if(res[k])counts[k]++;else miss.push(k)});
-    if(!miss)strict.push(r);
+    if(miss.length===0)strict.push(r);
     else if(miss.length===1){const o=Object.assign({},r);o.miss=miss[0];o.miss_reason=why(miss[0],r);near.push(o)}
   });
   const by=(a,b)=>(b.pct-a.pct)||(a.code<b.code?-1:1);
