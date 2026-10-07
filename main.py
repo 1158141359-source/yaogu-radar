@@ -1,142 +1,241 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-妖股雷达 v2
-硬条件：近3交易日涨停 + 上龙虎榜 + 总市值<=300亿
-评分：涨幅 + 换手率 + 龙虎榜净额 + 连板强度 + 封板强弱
+妖股雷达 v3 —— 行情口径：妙想(MX) + 东方财富公开数据（不使用任何第三方行情源）
 
-修复要点（相对原版）：
-1. 弃用 push2 实时行情接口（境外/云主机被服务端直接断连，是"市值 0.00亿"的根因），
-   改从涨停池 getTopicZTPool 的 tshare 字段取总市值（同一批请求里就带着，零额外成本）。
-2. 交易日/涨停池/龙虎榜按"日期"缓存：历史日期的数据当天不会变，避免每次刷新重算，
-   并保护妙想接口的日调用配额。
-3. 时区显式用 Asia/Shanghai（Render 服务器是 UTC，原来 datetime.now() 会取错日期）。
-4. 龙虎榜同一只股票一天可能有多条（多个上榜原因），原来按代码覆盖会算错净额，
-   现改为取当日绝对值最大的那条，并统计上榜次数。
-5. 涨停池分页取全（原来 pagesize=200 在大面日会截断丢数据）。
-6. 缓存加线程锁，防止并发刷新时重复打接口（cache stampede）。
-7. 市值取不到时显示 "--" 并标注"市值未知"，不再冒充 0.00 亿把硬条件永久判死。
-8. 妙想接口失败/无 KEY 时自动降级为"纯涨停池模式"，页面照常出结果而不是整站报错。
+硬条件：近3交易日涨停 + 上龙虎榜 + 总市值≤300亿
+评分：封板强弱20 + 连板梯队20 + 龙虎榜资金20 + 涨幅15 + 换手率15 + 机构席位10
+
+数据源（全部实测通过）：
+  妙想选股   mkapi2.dfcfs.com/finskillshub/api/claw/stock-screen   候选池主入口
+  ① 涨停池   push2ex.eastmoney.com/getTopicZTPool                  连板/首封/炸板/封单/行业/总市值
+  ② 龙虎榜   datacenter RPT_DAILYBILLBOARD_DETAILSNEW              净额/成交占比/流通市值/席位摘要/上榜原因
+  ③ 席位明细 datacenter RPT_BILLBOARD_DAILYDETAILSBUY|SELL         机构专用·沪深股通·游资营业部
+  ④ 全板块市值 datacenter RPT_VALUEANALYSIS_DET                    补齐 30/68 开头在涨停池取不到市值的缺口
+  ⑤ 交易日历 由①推导（date ≤ qdate 且 tc>0 即为真实交易日）
+
+关键坑（已在实现中规避，勿回退）：
+  · push2/push2his 系列在云端被服务端直接断连，不能用于取市值，否则市值恒为 0。
+  · 涨停池对非交易日不会返回空，而是回退到最近真实交易日的同一份数据；
+    直接按"今天往前数几天"取会得到多份重复池子，近3日涨停次数被虚高。
+  · data.qdate 恒等于最近真实交易日，不能用来逐日判定是否交易日。
+  · 涨停池 tshare 对 30/68 开头返回 0，必须由 ④ 补总市值。
+  · 龙虎榜同一只票一天可能多条（多个上榜原因），按 |净额| 取最大并合并原因，不能覆盖也不能累加。
+  · 龙虎榜当日约 18:00 后才披露，盘中取到空榜不能判成"没上榜"，要标"待披露"。
+  · Render 服务器是 UTC，日期一律显式用 Asia/Shanghai。
 """
 
 import os
+import re
 import json
+import hashlib
 import time
-import math
 import threading
+from pathlib import Path
 from datetime import datetime, timedelta, timezone
 
 import requests
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse, JSONResponse
 
-app = FastAPI(title="妖股雷达")
+# ============================== 配置 ==============================
 
 MX_URL = "https://mkapi2.dfcfs.com/finskillshub/api/claw/stock-screen"
+EM_DC = "https://datacenter-web.eastmoney.com/api/data/v1/get"
+EM_ZT = "https://push2ex.eastmoney.com/getTopicZTPool"
+ZT_UT = "7eea3edcaed734bea9cbfc24409ed989"
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                   "(KHTML, like Gecko) Chrome/120.0 Safari/537.36",
-    "Referer": "https://quote.eastmoney.com/",
+    "Referer": "https://data.eastmoney.com/",
 }
 
 CN_TZ = timezone(timedelta(hours=8))
 
 MAX_CAP_YI = 300.0        # 硬条件：总市值上限（亿元）
-LOOKBACK_DAYS = 3         # 硬条件：近 N 个交易日涨停
-CACHE_SECONDS = 60        # 雷达结果缓存
-MX_CACHE_SECONDS = 900    # 妙想候选缓存 15 分钟，省日配额
+LOOKBACK = 3              # 硬条件：近 N 个交易日涨停
+SEAT_LOOKBACK = 3         # 席位明细取近 N 个交易日（已确认）
+LHB_PUBLISH_HOUR = 18     # 龙虎榜约当日 18:00 后披露
 
-# ---------------------------------------------------------------- 基础设施
+CACHE_SECONDS = 60        # 最新交易日数据缓存
+HIST_TTL = 6 * 3600       # 历史交易日数据缓存
+MX_CACHE_SECONDS = 15 * 60
+DATE_TTL = 3600
+
+BASE_DIR = Path(__file__).resolve().parent
+SNAP_DIR = BASE_DIR / "snapshots"
+SNAP_FILE = SNAP_DIR / "妖股雷达快照.json"
+
+app = FastAPI(title="妖股雷达")
+
+# ============================== 基础设施 ==============================
 
 _lock = threading.RLock()
-_STORE = {}                       # 通用缓存池：key -> (过期时间戳, 值)
-_RADAR = {"ts": 0, "data": [], "meta": {}, "source": "未连接", "error": None}
+_STORE: dict = {}
+_STATE = {
+    "ts": 0.0,
+    "data": [],
+    "tiers": {},
+    "meta": {},
+    "source": "未连接",
+    "error": None,
+    "refreshing": False,
+    "last_try": 0.0,
+}
 
 
-def _cached(key, ttl, producer, now=None):
-    """带锁的 TTL 缓存。ttl 可为按天失效的历史数据。"""
+def _cache_get(key, now=None):
     now = now if now is not None else time.time()
     with _lock:
         hit = _STORE.get(key)
         if hit and hit[0] > now:
-            return hit[1]
-    val = producer()
+            return True, hit[1]
+    return False, None
+
+
+def _cache_put(key, val, ttl, now=None):
+    now = now if now is not None else time.time()
     with _lock:
         _STORE[key] = (now + ttl, val)
+
+
+def cached(key, ttl, producer):
+    ok, val = _cache_get(key)
+    if ok:
+        return val
+    val = producer()
+    _cache_put(key, val, ttl)
     return val
 
 
-def _today_key():
-    return datetime.now(CN_TZ).strftime("%Y%m%d")
-
-
-def http_get(url, params=None, timeout=15, tries=3):
-    """带退避重试的 GET；三次都失败才抛异常。"""
+def http_json(url, params=None, timeout=15, tries=3, headers=None, method="GET", payload=None):
+    """带退避重试。三次都失败才抛异常。"""
     last = None
     for i in range(tries):
         try:
-            r = requests.get(url, params=params, headers=HEADERS, timeout=timeout)
+            if method == "POST":
+                r = requests.post(url, params=params, json=payload,
+                                  headers=headers or HEADERS, timeout=timeout)
+            else:
+                r = requests.get(url, params=params, headers=headers or HEADERS, timeout=timeout)
             r.raise_for_status()
             return r.json()
         except Exception as e:                      # noqa: BLE001
             last = e
             if i < tries - 1:
-                time.sleep(0.6 * (i + 1))
+                time.sleep(0.5 * (i + 1))
     raise last
 
 
-def yd(v):
-    """元 -> 亿元"""
-    try:
-        return round(float(v or 0) / 1e8, 2)
-    except Exception:                               # noqa: BLE001
-        return None
+def dc(params, tries=3):
+    """datacenter 报表统一入口：success=False 会明确报错，避免列名写错时静默返回空结果。"""
+    j = http_json(EM_DC, params, timeout=15, tries=tries)
+    if j.get("success") is False:
+        raise RuntimeError("东财报表错误: %s | %s" % (j.get("message"), params.get("reportName")))
+    return j.get("result") or {}
 
 
 def num(v, default=0.0):
+    """支持东财/妙想的中文单位字符串："111.85亿"、"8997.11万"、"1,234.5"、"10.04%"。"""
     try:
         if v is None:
             return default
         s = str(v).strip().replace(",", "").replace("%", "")
         if s in ("", "-", "--", "None", "null"):
             return default
+        for suf, mul in (("亿", 1e8), ("万", 1e4)):
+            if s.endswith(suf):
+                return float(s[:-len(suf)]) * mul
         return float(s)
     except Exception:                               # noqa: BLE001
         return default
 
 
-# ---------------------------------------------------------------- 1. 妙想：只负责找候选
+def yi(v, nd=2):
+    """-> 亿元。已带"亿/万"单位的字符串会自动换算；取不到返回 None（区别于 0，
+    避免把取数失败当成"市值 0"从而把硬条件永久判死）。"""
+    f = num(v, default=0.0)
+    if f <= 0:
+        return None
+    return round(f / 1e8, nd)
 
-QUERY = """
-请筛选今天A股市场最强势的股票候选，返回至少30只。
-重点关注：1.今日涨幅较大；2.今日换手率较高；3.最近出现涨停；
-4.最近出现龙虎榜；5.市值300亿元以内；6.排除ST、*ST、退市股票。
-请返回：股票代码、股票简称、最新价、涨跌幅、换手率。
-不要因为缺少市值、龙虎榜或涨停次数而不返回股票。
+
+def clamp(v, lo, hi):
+    return max(lo, min(hi, v))
+
+
+def d8_to_dashed(d):
+    return "%s-%s-%s" % (d[:4], d[4:6], d[6:])
+
+
+def limit_pct(code):
+    """主板 10%，创业板/科创板 20%，北交所 30%"""
+    if code.startswith(("30", "68")):
+        return 20.0
+    if code.startswith(("43", "83", "87", "92")):
+        return 30.0
+    return 10.0
+
+
+# ============================== 1. 妙想选股（候选池主入口） ==============================
+
+MX_QUERY = """
+近三个交易日涨停且当日换手率较高的A股，排除ST股，返回100只，
+包含股票代码、股票简称、涨跌幅、换手率、总市值、概念题材。
 """
+
+MX_HEADERS = {"Content-Type": "application/json"}
+MX_LIMITED = threading.Event()          # 触发日限额后本进程不再打妙想
+
+
+def build_mx_column_map(columns):
+    m = {}
+    for c in columns or []:
+        if not isinstance(c, dict):
+            continue
+        en = c.get("field") or c.get("name") or c.get("key") or ""
+        cn = c.get("displayName") or c.get("title") or c.get("label") or ""
+        if c.get("dateMsg"):
+            cn = (cn + " " + c["dateMsg"]).strip()
+        if en:
+            m[str(en)] = str(cn)
+    return m
 
 
 def mx_raw():
     key = os.getenv("MX_APIKEY")
     if not key:
         raise RuntimeError("MX_APIKEY 未设置")
-    r = requests.post(MX_URL,
-                      headers={"Content-Type": "application/json", "apikey": key},
-                      json={"keyword": QUERY}, timeout=40)
-    r.raise_for_status()
-    obj = r.json()
+    obj = http_json(MX_URL, payload={"keyword": MX_QUERY}, timeout=40, tries=2,
+                    headers={**MX_HEADERS, "apikey": key}, method="POST")
     if obj.get("status") != 0:
-        raise RuntimeError("妙想返回异常: %s" % obj.get("message"))
+        raise RuntimeError("妙想顶层错误 status=%s %s" % (obj.get("status"), obj.get("message")))
+    biz = (obj.get("data") or {}).get("code")
+    if biz in (113, "113", 429, "429"):
+        MX_LIMITED.set()
+        raise RuntimeError("妙想日调用次数已达上限(code=%s)，本进程后续自动降级" % biz)
     return obj
 
 
-def parse_mx(obj):
-    inner = (((obj or {}).get("data") or {}).get("data") or {})
-    result = ((inner.get("allResults") or {}).get("result") or {})
-    rows = result.get("dataList") or []
+def mx_rows_of(obj):
+    """优先全量 dataList，其次解析 partialResults 的 Markdown 表格"""
+    inner = ((obj.get("data") or {}).get("data") or {})
+    res = (inner.get("allResults") or {}).get("result") or inner.get("result") or {}
+    rows, cols = res.get("dataList") or [], res.get("columns") or []
     if rows:
-        return rows
+        cn = build_mx_column_map(cols)
+        out = []
+        for r in rows:
+            if not isinstance(r, dict):
+                continue
+            dual = dict(r)                          # 英文键原样保留
+            for k, v in r.items():
+                alias = cn.get(k)
+                if alias and alias != k:
+                    dual.setdefault(alias, v)       # 中文标题作为别名并列
+            out.append(dual)
+        return out
     lines = [x.strip() for x in str(inner.get("partialResults") or "").splitlines()
              if x.strip().startswith("|")]
     if len(lines) < 3:
@@ -147,121 +246,129 @@ def parse_mx(obj):
 
     head = cells(lines[0])
     out = []
-    for line in lines[2:]:
-        vals = cells(line)
-        if len(vals) == len(head):
-            out.append(dict(zip(head, vals)))
+    for ln in lines[2:]:
+        v = cells(ln)
+        if len(v) == len(head):
+            out.append(dict(zip(head, v)))
     return out
 
 
-def pick(row, names, fuzzy=False):
-    """先精确命中列名；模糊匹配时只认包含关系，并按列名长度升序取最短的一个，
-    避免把"近5日涨跌幅"当成"涨跌幅"。"""
+def mx_pick(row, names):
+    """按候选列名取值：精确命中 > 前缀命中 > 包含命中，同级别取最短列名。
+    前缀优先很关键：否则搜"涨跌幅"可能命中"近5日涨跌幅"。"""
     for n in names:
-        if n in row and row[n] not in ("", None):
+        if row.get(n) not in (None, ""):
             return row[n]
-    if not fuzzy:
-        return ""
-    cand = []
-    for k, v in row.items():
-        if v in ("", None):
-            continue
-        lk = str(k).lower()
-        for n in names:
-            if n.lower() in lk:
-                cand.append((len(str(k)), v))
-                break
-    cand.sort(key=lambda x: x[0])
-    return cand[0][1] if cand else ""
+    for mode in (lambda k, n: k.startswith(n), lambda k, n: n in k):
+        cand = []
+        for k, v in row.items():
+            if v in (None, ""):
+                continue
+            ks = str(k)
+            for n in names:
+                if mode(ks, n):
+                    cand.append((len(ks), v))
+                    break
+        if cand:
+            return sorted(cand, key=lambda x: x[0])[0][1]
+    return ""
 
 
 def mx_candidates():
+    """返回 (候选列表, 状态说明)。失败不抛异常，交由调用方降级。"""
+    if MX_LIMITED.is_set():
+        return [], "妙想已达日限额，本次运行内不再请求"
+
     def build():
         try:
-            rows = parse_mx(mx_raw())
-        except Exception as e:                      # noqa: BLE001
-            print("MX_SKIP:", repr(e)[:160])
-            return []
+            rows = mx_rows_of(mx_raw())
+        except Exception as e:                          # noqa: BLE001
+            # 失败不入缓存，否则一次网络抖动会把妙想锁死 15 分钟
+            print("MX_FAIL", repr(e)[:150])
+            return (None, "妙想不可用：%s" % str(e)[:120])
         out = []
-        for row in rows:
-            code = "".join(c for c in str(pick(row, ["SECURITY_CODE", "股票代码", "证券代码", "代码"]))
+        for r in rows:
+            code = "".join(c for c in str(mx_pick(r, ["SECURITY_CODE", "股票代码", "证券代码", "代码"]))
                            if c.isdigit())
-            name = str(pick(row, ["SECURITY_SHORT_NAME", "SECURITY_NAME_ABBR",
-                                  "股票简称", "证券简称", "名称"])).strip()
+            name = str(mx_pick(r, ["SECURITY_SHORT_NAME", "SECURITY_NAME_ABBR",
+                                   "股票简称", "证券简称", "名称"])).strip()
             if len(code) != 6 or not name:
                 continue
             out.append({"code": code, "name": name,
-                        "price": num(pick(row, ["NEWEST_PRICE", "最新价", "现价"])),
-                        "pct": num(pick(row, ["CHG", "涨跌幅", "涨幅"])),
-                        "turnover": num(pick(row, ["TURNOVER_RATE", "换手率", "HSL"]))})
-        print("MX_OK 候选%d只" % len(out))
-        return out
+                        "price": num(mx_pick(r, ["NEWEST_PRICE", "最新价", "现价", "收盘价"])),
+                        "pct": num(mx_pick(r, ["CHG", "涨跌幅", "涨幅"])),
+                        "turnover": num(mx_pick(r, ["TURNOVER_RATE", "换手率", "HSL"])),
+                        "cap": yi(mx_pick(r, ["TOTAL_MARKET_CAP", "TOAL_MARKET_VALUE",
+                                               "TOTAL_MARKET_VALUE", "总市值", "市值"])),
+                        "industry": str(mx_pick(r, ["东财行业总分类", "RPT_F10_ORG_BASICINFO_BOARD_NAME",
+                                                    "所属行业", "行业"])) or "",
+                        "concepts": str(mx_pick(r, ["STYLE_CONCEPT", "概念", "题材"])) or "",
+                        "liangbi": num(mx_pick(r, ["LIANGBI", "量比"])) or None})
+        return (out, "妙想选股正常，返回 %d 只候选" % len(out))
 
-    return _cached("mx_cand_" + _today_key(), MX_CACHE_SECONDS, build)
-
-
-# ---------------------------------------------------------------- 2. 交易日历（借龙虎榜的日期分布反推）
-#
-# 为什么不能拿"请求某个日期 + 看涨停池是否有数据"来判定交易日：
-# 接口对非交易日/未来日期不会返回空，而是回退(clamp)到最近一个真实交易日的池子，
-# 于是国庆长假会连着好天返回同一份 9/30 数据 —— 近3日涨停次数被虚高成 3 次。
-# data 里的 qdate 也恒等于最近交易日，同样不能用于判定。
-# 龙虎榜每条记录自带真实 TRADE_DATE，用一次区间查询就能拿到真实交易日历。
-
-def _lhb_page(page, flt, columns="SECURITY_CODE,SECURITY_NAME_ABBR,BILLBOARD_NET_AMT,"
-                                     "BILLBOARD_BUY_AMT,BILLBOARD_SELL_AMT,TRADE_DATE",
-               sort="BILLBOARD_NET_AMT", size=500):
-    return http_get("https://datacenter-web.eastmoney.com/api/data/v1/get",
-                    {"reportName": "RPT_DAILYBILLBOARD_DETAILSNEW", "columns": columns,
-                     "pageNumber": page, "pageSize": size,
-                     "sortColumns": sort, "sortTypes": -1,
-                     "source": "WEB", "client": "WEB", "filter": flt})
+    key = "mx_" + datetime.now(CN_TZ).strftime("%Y%m%d%H")
+    ok, val = _cache_get(key)
+    if ok:
+        return val
+    out, msg = build()
+    if out is None:                                   # 失败不写缓存，下次刷新即重试
+        return [], msg
+    _cache_put(key, (out, msg), MX_CACHE_SECONDS)
+    return out, msg
 
 
-def get_trading_dates(count=LOOKBACK_DAYS):
+# ============================== 2. 交易日历（涨停池推导） ==============================
+
+def _zt_probe(date):
+    """轻量探测：返回 (tc, qdate)"""
+    j = http_json(EM_ZT, {"ut": ZT_UT, "dpt": "wz.ztzt", "Pageindex": 0, "pagesize": 1,
+                          "sort": "fbt:asc", "date": date}, timeout=10, tries=2)
+    got = j.get("data") or {}
+    return int(num(got.get("tc"))), str(got.get("qdate") or "")
+
+
+def get_trading_dates(count=LOOKBACK):
     def build():
-        end = datetime.now(CN_TZ)
-        for window in (16, 40):                       # 先看半个月，不够再放宽到 40 天
-            begin = end - timedelta(days=window)
-            flt = "(TRADE_DATE>='%s')(TRADE_DATE<='%s')" % (
-                begin.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d"))
-            seen = set()
-            for page in (1, 2, 3):
-                res = (_lhb_page(page, flt, columns="TRADE_DATE", sort="TRADE_DATE")
-                       .get("result") or {})
-                rows = res.get("data") or []
-                seen.update(r["TRADE_DATE"][:10].replace("-", "") for r in rows)
-                if not rows or page >= (res.get("pages") or 1):
-                    break
-            dates = sorted(seen, reverse=True)[:count]
-            if len(dates) >= count or (dates and window == 40):
-                print("TRADING_DATES:", dates)
-                return dates
-        raise RuntimeError("未取到任何交易日")
+        today = datetime.now(CN_TZ)
+        _, latest = _zt_probe(today.strftime("%Y%m%d"))
+        if not latest or len(latest) != 8:
+            raise RuntimeError("未取到最近交易日")
+        dates, day = [], datetime.strptime(latest, "%Y%m%d").replace(tzinfo=CN_TZ)
+        for _ in range(45):
+            d = day.strftime("%Y%m%d")
+            if day.weekday() >= 5:                      # 周末直接跳过，省请求
+                day -= timedelta(days=1)
+                continue
+            try:
+                tc, _ = _zt_probe(d)
+                if tc > 0:
+                    dates.append(d)
+                    if len(dates) >= count:
+                        break
+            except Exception as e:                      # noqa: BLE001
+                print("DATE_PROBE_ERR", d, repr(e)[:80])
+            day -= timedelta(days=1)
+        if not dates:
+            raise RuntimeError("交易日历为空")
+        print("TRADING_DATES", dates, "latest=%s" % latest)
+        return dates, latest
 
-    return _cached("trade_dates_" + _today_key(), 3600, build)
+    return cached("dates_" + datetime.now(CN_TZ).strftime("%Y%m%d"), DATE_TTL, build)
 
 
-def _is_hist(date, latest):
-    """历史日期数据不再变化，可以长缓存。"""
-    return date != latest
+# ============================== 3. 涨停池 ==============================
 
-
-# ---------------------------------------------------------------- 3. 涨停池（含总市值/封板细节）
-
-def get_zt_pool(date, latest=None):
+def get_zt_pool(date, latest):
     def build():
         pool, page, tc = [], 0, None
         while True:
-            data = http_get("https://push2ex.eastmoney.com/getTopicZTPool",
-                            {"ut": "7eea3edcaed734bea9cbfc24409ed989", "dpt": "wz.ztzt",
-                             "Pageindex": page, "pagesize": 200, "sort": "fbt:asc", "date": date},
-                            timeout=15)
-            got = data.get("data") or {}
+            got = (http_json(EM_ZT, {"ut": ZT_UT, "dpt": "wz.ztzt", "Pageindex": page,
+                                     "pagesize": 200, "sort": "fbt:asc", "date": date},
+                             timeout=15).get("data") or {})
             chunk = got.get("pool") or []
             pool.extend(chunk)
-            tc = got.get("tc") or 0
-            if not chunk or len(pool) >= tc or page > 20:
+            tc = int(num(got.get("tc")))
+            if not chunk or len(pool) >= tc or page > 25:
                 break
             page += 1
         out = {}
@@ -269,232 +376,539 @@ def get_zt_pool(date, latest=None):
             code = str(it.get("c", "")).zfill(6)
             zt = it.get("zttj") or {}
             out[code] = {
-                "name": it.get("n", ""),
+                "name": str(it.get("n", "")),
                 "pct": round(num(it.get("zdp")), 2),
                 "turnover": round(num(it.get("hs")), 2),
-                "price": round(num(it.get("p", 0)) / 1000, 2),    # p 是 元×1000（用 tshare/股本反推确认）
-                "cap": yd(it.get("tshare")),                      # 总市值（亿）
-                "float_cap": yd(it.get("ltsz")),
-                "lianban": int(num(it.get("lbc"))),                # 连板次数
+                "price": round(num(it.get("p")) / 1000, 2),          # p 是 元×1000
+                "amount": yi(num(it.get("amount")) * 1e4, 2),        # 成交额 万元 -> 亿
+                "cap_pool": yi(it.get("tshare")),                    # 总市值（30/68 开头常为 0）
+                "float_cap": yi(it.get("ltsz")),
+                "lianban": int(num(it.get("lbc"))),
                 "days": int(num(zt.get("days"))),
-                "boards": int(num(zt.get("ct"))),                  # N天M板
-                "seal_fund": yd(it.get("fund")),                   # 封单金额（亿）
-                "first_seal": int(num(it.get("fbt"))),              # 首次封板 09:25 -> 92500
+                "boards": int(num(zt.get("ct"))),
+                "seal_fund": yi(it.get("fund")),
+                "first_seal": int(num(it.get("fbt"))),
                 "last_seal": int(num(it.get("lbt"))),
-                "open_times": int(num(it.get("zbc"))),              # 炸板次数
-                "industry": it.get("hybk", ""),
+                "open_times": int(num(it.get("zbc"))),
+                "industry": str(it.get("hybk", "")),
             }
-        print("ZT %s -> %d只" % (date, len(out)))
+        print("ZT_POOL", date, "->", len(out))
         return out
 
-    # 最新交易日盘中会变 -> 短缓存；更早的历史日期不再变化 -> 长缓存
-    ttl = CACHE_SECONDS if not _is_hist(date, latest) else 6 * 3600
-    return _cached("zt_" + date, ttl, build)
+    ttl = CACHE_SECONDS if date == latest else HIST_TTL
+    return cached("zt_" + date, ttl, build)
 
 
-# ---------------------------------------------------------------- 4. 龙虎榜（同日多条要合并）
+# ============================== 4. 龙虎榜 ==============================
 
-def get_lhb(date, latest=None):
+def get_lhb(date, latest):
     def build():
-        rows = []
-        for page in range(1, 6):
-            data = http_get("https://datacenter-web.eastmoney.com/api/data/v1/get",
-                            {"reportName": "RPT_DAILYBILLBOARD_DETAILSNEW",
-                             "columns": "SECURITY_CODE,SECURITY_NAME_ABBR,BILLBOARD_NET_AMT,"
-                                        "BILLBOARD_BUY_AMT,BILLBOARD_SELL_AMT,TRADE_DATE",
-                             "pageNumber": page, "pageSize": 500,
-                             "sortColumns": "BILLBOARD_NET_AMT", "sortTypes": -1,
-                             "source": "WEB", "client": "WEB",
-                             "filter": "(TRADE_DATE='%s-%s-%s')" % (date[:4], date[4:6], date[6:])},
-                            timeout=15)
-            res = data.get("result") or {}
+        rows, page = [], 1
+        flt = "(TRADE_DATE='%s')" % d8_to_dashed(date)
+        while page <= 8:
+            res = dc({"reportName": "RPT_DAILYBILLBOARD_DETAILSNEW",
+                      "columns": "ALL", "pageNumber": page, "pageSize": 500,
+                      "sortColumns": "BILLBOARD_NET_AMT", "sortTypes": -1,
+                      "source": "WEB", "client": "WEB", "filter": flt})
             chunk = res.get("data") or []
             rows.extend(chunk)
-            if not chunk or page >= (res.get("pages") or 1):
+            if not chunk or page >= int(num(res.get("pages"), 1)):
                 break
+            page += 1
         out = {}
-        for row in rows:
-            code = str(row.get("SECURITY_CODE", "")).zfill(6)
-            net = num(row.get("BILLBOARD_NET_AMT"))
-            item = out.setdefault(code, {"net": 0.0, "times": 0})
-            item["times"] += 1
-            # 一只票多个上榜原因时，取绝对值最大的那条，避免重复累加
-            if abs(net) > abs(item["net"]):
-                item["net"] = net
-        print("LHB %s -> %d只 / %d条" % (date, len(out), len(rows)))
+        for r in rows:
+            code = str(r.get("SECURITY_CODE", "")).zfill(6)
+            net = num(r.get("BILLBOARD_NET_AMT"))
+            it = out.get(code)
+            if it is None or abs(net) > abs(it["net_raw"]):
+                it = {
+                    "net_raw": net,
+                    "buy_raw": num(r.get("BILLBOARD_BUY_AMT")),
+                    "sell_raw": num(r.get("BILLBOARD_SELL_AMT")),
+                    "deal_raw": num(r.get("BILLBOARD_DEAL_AMT")),
+                    "deal_ratio": round(num(r.get("DEAL_AMOUNT_RATIO")), 2),
+                    "float_cap": yi(r.get("FREE_MARKET_CAP")),
+                    "close": round(num(r.get("CLOSE_PRICE")), 2),
+                    "chg": round(num(r.get("CHANGE_RATE")), 2),
+                    "turnover": round(num(r.get("TURNOVERRATE")), 2),
+                    "market": str(r.get("TRADE_MARKET", "") or r.get("MARKET", "")),
+                    "explain": str(r.get("EXPLAIN", "") or ""),
+                    "reasons": set(),
+                    "times": 0,
+                }
+                out[code] = it
+            why = str(r.get("EXPLANATION", "") or "").strip()
+            if why:
+                it["reasons"].add(why)
+            it["times"] += 1
+        for it in out.values():
+            it["net"] = round(it["net_raw"] / 1e8, 2)
+            it["buy"] = round(it["buy_raw"] / 1e8, 2)
+            it["sell"] = round(it["sell_raw"] / 1e8, 2)
+            it["deal"] = round(it["deal_raw"] / 1e8, 2)
+            m = re.search(r"(\d+)家机构(买入|卖出)", it["explain"])
+            it["org_cnt"] = int(m.group(1)) if m else 0
+            it["org_dir"] = m.group(2) if m else ""
+            w = re.search(r"成功率([\d.]+)%", it["explain"])
+            it["org_win"] = float(w.group(1)) if w else None
+            it["reason"] = " / ".join(sorted(it["reasons"]))
+            del it["reasons"]
+        print("LHB", date, "->", len(out), "只 /", len(rows), "条")
         return out
 
-    ttl = CACHE_SECONDS if not _is_hist(date, latest) else 6 * 3600
-    return _cached("lhb_" + date, ttl, build)
+    ttl = CACHE_SECONDS if date == latest else HIST_TTL
+    return cached("lhb_" + date, ttl, build)
 
 
-# ---------------------------------------------------------------- 5. 组装雷达
+# ============================== 5. 席位明细（近 SEAT_LOOKBACK 日） ==============================
 
-def hard_hit(p):
-    """三个硬条件分别判定；市值未知记 None 而不是 False。"""
-    return {
-        "zt": p["zt_days"] > 0,
-        "lhb": p["on_board"],
-        "cap": None if p["cap"] in (None, 0) else p["cap"] <= MAX_CAP_YI,
-    }
+def seat_kind(name):
+    n = str(name or "")
+    if "机构专用" in n:
+        return "org"
+    if "股通" in n:                       # 沪股通专用 / 深股通专用
+        return "north"
+    return "hot"                          # 游资营业部
 
+
+def get_seats(date, latest):
+    def build():
+        agg = {}
+        flt = "(TRADE_DATE='%s')" % d8_to_dashed(date)
+        for side, rep in (("buy", "RPT_BILLBOARD_DAILYDETAILSBUY"),
+                          ("sell", "RPT_BILLBOARD_DAILYDETAILSSELL")):
+            page = 1
+            while page <= 12:
+                res = dc({"reportName": rep, "columns": "ALL", "pageNumber": page,
+                          "pageSize": 500, "source": "WEB", "client": "WEB", "filter": flt})
+                chunk = res.get("data") or []
+                for r in chunk:
+                    code = str(r.get("SECURITY_CODE", "")).zfill(6)
+                    name = str(r.get("OPERATEDEPT_NAME", "") or "")
+                    kind = seat_kind(name)
+                    it = agg.setdefault(code, {
+                        "org": 0.0, "north": 0.0, "hot": 0.0,
+                        "buy_total": 0.0, "sell_total": 0.0,
+                        "top_buy": [], "top_sell": [], "org_win": [],
+                        "top_buy_map": {}, "top_sell_map": {},
+                    })
+                    b, s = num(r.get("BUY")), num(r.get("SELL"))
+                    it[kind] += b - s
+                    it["buy_total"] += b
+                    it["sell_total"] += s
+                    if kind == "org" and r.get("RISE_PROBABILITY_3DAY") is not None:
+                        it["org_win"].append(num(r.get("RISE_PROBABILITY_3DAY")))
+                    tgt = "top_buy" if side == "buy" else "top_sell"
+                    slot = it.setdefault(tgt + "_map", {})
+                    cur = slot.setdefault(name, {"seat": name, "kind": kind, "amt": 0.0, "net": 0.0})
+                    cur["amt"] += (b if side == "buy" else s) / 1e8
+                    cur["net"] += (b - s) / 1e8
+                if not chunk or page >= int(num(res.get("pages"), 1)):
+                    break
+                page += 1
+        for code, it in agg.items():
+            for side_key in ("top_buy", "top_sell"):
+                lst = sorted(it.pop(side_key + "_map", {}).values(), key=lambda x: -x["amt"])
+                for x in lst:
+                    x["amt"] = round(x["amt"], 3)
+                    x["net"] = round(x["net"], 3)
+                it[side_key] = lst
+            for k in ("org", "north", "hot", "buy_total", "sell_total"):
+                it[k] = round(it[k] / 1e8, 3)
+            it["net_total"] = round(it["buy_total"] - it["sell_total"], 3)
+            it["top_buy"] = it["top_buy"][:5]
+            it["top_sell"] = it["top_sell"][:5]
+            it["org_win"] = round(sum(it["org_win"]) / len(it["org_win"]), 2) if it["org_win"] else None
+        print("SEATS", date, "->", len(agg), "只")
+        return agg
+
+    ttl = CACHE_SECONDS if date == latest else HIST_TTL
+    return cached("seats_" + date, ttl, build)
+
+
+# ============================== 6. 全板块总市值 ==============================
+
+def get_caps(codes, date):
+    """④ RPT_VALUEANALYSIS_DET：含 30/68 开头的总市值，涨停池 tshare 对这些是 0"""
+    cl = sorted(set(codes))
+    if not cl:
+        return {}
+    tag = hashlib.md5((",".join(cl) + date).encode()).hexdigest()[:10]
+
+    def build():
+        out, chunk = {}, 60
+        for i in range(0, len(cl), chunk):
+            part = cl[i:i + chunk]
+            inlist = ",".join('"%s"' % c for c in part)
+            flts = ["(TRADE_DATE='%s')(SECURITY_CODE in (%s))" % (d8_to_dashed(date), inlist),
+                    "(SECURITY_CODE in (%s))" % inlist]      # 兜底：不限日期，取每票最新一条
+            for k, flt in enumerate(flts):
+                page = 1
+                got_any = False
+                while page <= 8:
+                    res = dc({"reportName": "RPT_VALUEANALYSIS_DET",
+                              "columns": "SECURITY_CODE,SECURITY_NAME_ABBR,TOTAL_MARKET_CAP,"
+                                         "NOTLIMITED_MARKETCAP_A,CLOSE_PRICE,CHANGE_RATE,"
+                                         "PE_TTM,PB_MRQ,BOARD_NAME,TRADE_DATE",
+                              "pageNumber": page, "pageSize": 500,
+                              "sortColumns": "TRADE_DATE" if k else "SECURITY_CODE",
+                              "sortTypes": -1 if k else 1,
+                              "source": "WEB", "client": "WEB", "filter": flt})
+                    rows = res.get("data") or []
+                    got_any = got_any or bool(rows)
+                    for r in rows:
+                        code = str(r.get("SECURITY_CODE", "")).zfill(6)
+                        if k and code in out:          # 兜底模式：已取到目标日则不覆盖
+                            continue
+                        out[code] = {"cap": yi(r.get("TOTAL_MARKET_CAP")),
+                                     "float_cap": yi(r.get("NOTLIMITED_MARKETCAP_A")),
+                                     "close": round(num(r.get("CLOSE_PRICE")), 2),
+                                     "chg": round(num(r.get("CHANGE_RATE")), 2),
+                                     "pe": round(num(r.get("PE_TTM")), 2) or None,
+                                     "pb": round(num(r.get("PB_MRQ")), 2) or None,
+                                     "board": str(r.get("BOARD_NAME", "") or "")}
+                    if not rows or page >= int(num(res.get("pages"), 1)):
+                        break
+                    page += 1
+                if got_any:
+                    break
+        print("CAPS", date, "->", len(out))
+        return out
+
+    # 只按最新交易日取市值（盘中会变），故统一用短缓存
+    return cached("caps_" + tag, CACHE_SECONDS, build)
+
+
+# ============================== 7. 指标与评分 ==============================
 
 def seal_strength(p):
-    """封板强弱：首封越早、炸板越少、封单占流通市值比越高 -> 分越高（0~1）。"""
-    fbt = p["first_seal"]
+    """东财代理指标：首封时间越早 + 炸板越少 + 封单/流通市值比越高 -> 越强 (0~1)"""
+    fbt = p.get("first_seal") or 0
     if fbt <= 0:
-        t_score = 0.35
+        t_score = 0.30
     else:
         h, m = divmod(fbt // 100, 100)
-        minutes = (h * 60 + m) - (9 * 60 + 25)
-        t_score = max(0.0, 1.0 - min(max(minutes, 0), 210) / 210)
-    zbc = p["open_times"]
-    z_score = 1.0 if zbc == 0 else max(0.0, 1.0 - zbc * 0.28)
-    fc = p["float_cap"] or 0
-    ratio = (p["seal_fund"] or 0) / fc if fc > 0 else 0
-    f_score = min(ratio / 0.02, 1.0)
+        mins = (h * 60 + m) - (9 * 60 + 25)
+        t_score = clamp(1.0 - clamp(mins, 0, 215) / 215, 0, 1)
+    zbc = p.get("open_times") or 0
+    z_score = 1.0 if zbc == 0 else clamp(1.0 - zbc * 0.28, 0, 1)
+    fc = p.get("float_cap") or 0
+    sf = p.get("seal_fund") or 0
+    f_score = clamp((sf / fc) / 0.02, 0, 1) if fc > 0 else 0.0
     return round(0.4 * t_score + 0.3 * z_score + 0.3 * f_score, 4)
 
 
-def score(p):
-    """总分 0~100：涨幅20 + 换手20 + 连板20 + 龙虎榜资金25 + 封板强弱15。"""
-    s_pct = min(max(p["pct"], 0), 10) / 10 * 20
+def tier_of(n):
+    if n >= 4:
+        return "4板及以上"
+    if n == 3:
+        return "3板"
+    if n == 2:
+        return "2板"
+    return "首板"
+
+
+def score_row(p):
+    """总分 0~100，各维度见文件头注释"""
+    lim = limit_pct(p["code"])
+    s_pct = clamp(p["pct"], 0, lim) / lim * 15
 
     t = p["turnover"]
-    if t <= 0:
-        s_to = 0.0
-    elif t <= 20:                       # 20% 换手以内线性给分
-        s_to = t / 20 * 18
-    else:                               # 过高换手视为分歧，反向扣分
-        s_to = max(6.0, 18 - (t - 20) * 0.6)
+    s_turn = clamp(t, 0, 20) / 20 * 13.5 if t > 0 else 0.0
+    if t > 25:
+        s_turn -= min(4.0, (t - 25) * 0.3)
+    s_turn = clamp(s_turn, 0, 15)
 
-    lb = max(p["zt_days"], p["lianban"])
-    s_lb = min(lb, 4) / 4 * 20
+    ladder = max(p["zt_days"], p["lianban"], p["boards"])
+    s_ladder = min(ladder, 4) / 4 * 20
 
     net = p["lhb_net"]
-    if net <= 0:
-        s_net = 0.0 if net == 0 else max(0.0, 8 + net * 3)   # 净卖出少量分
+    if net > 0:
+        s_net = min(net / 3.0, 1.0) * 20
+    elif net < 0:
+        s_net = -min(abs(net) / 3.0, 1.0) * 5 + 4       # 净卖出：给基础分但倒扣
+        s_net = clamp(s_net, 0, 20)
     else:
-        s_net = min(net / 3.0, 1.0) * 25
+        s_net = 0.0
+    s_seal = seal_strength(p) * 20
 
-    s_seal = seal_strength(p) * 15
-    return round(s_pct + s_to + s_lb + s_net + s_seal, 1)
+    org = p.get("org_net") or 0
+    s_org = min(max(org, 0) / 1.0, 1.0) * 8
+    win = p.get("seat_org_win")
+    if win is not None:
+        s_org += clamp((win - 35.0) / 15.0, -1, 1) * 2
+    s_org = clamp(s_org, 0, 10)
 
+    detail = {"涨幅": round(s_pct, 1), "换手": round(s_turn, 1), "连板梯队": round(s_ladder, 1),
+              "龙虎榜资金": round(s_net, 1), "封板强弱": round(s_seal, 1), "机构席位": round(s_org, 1)}
+    return clamp(sum(detail.values()), 0, 100), detail
+
+
+# ============================== 8. 组装 ==============================
 
 def build_radar():
-    dates = get_trading_dates(LOOKBACK_DAYS)
-    latest = dates[0]
+    dates, latest = get_trading_dates(LOOKBACK)
     pools = {d: get_zt_pool(d, latest) for d in dates}
     lhbs = {d: get_lhb(d, latest) for d in dates}
+    seats = {d: get_seats(d, latest) for d in dates[:SEAT_LOOKBACK]}
 
+    mx_list, mx_msg = mx_candidates()
+    mx_ok = bool(mx_list)
     cands = {}
-    for c in mx_candidates():
-        cands.setdefault(c["code"], c)
-    for d in dates:                                 # 涨停池兜底，也保证市值一定有
+    for c in mx_list:
+        cands.setdefault(c["code"], {"code": c["code"], "name": c["name"],
+                                     "price": c["price"], "pct": c["pct"],
+                                     "turnover": c["turnover"], "cap_mx": c["cap"],
+                                     "industry_mx": c.get("industry", ""),
+                                     "concepts": c.get("concepts", "")})
+    for d in dates:                                  # 涨停池兜底（同时保证硬条件可判）
         for code, it in pools[d].items():
-            cands.setdefault(code, {"code": code, "name": it["name"],
-                                    "price": it["price"], "pct": it["pct"],
-                                    "turnover": it["turnover"]})
+            e = cands.setdefault(code, {"code": code})
+            e.setdefault("name", it["name"])
+            e.setdefault("price", it["price"])
+            e.setdefault("pct", it["pct"])
+            e.setdefault("turnover", it["turnover"])
+
+    caps = get_caps(list(cands), latest)
+
+    # 晋级率：上一交易日涨停的票里，本日继续涨停的比例
+    promo = {}
+    for i in range(len(dates) - 1):
+        cur, prev = pools[dates[i]], pools[dates[i + 1]]
+        if prev:
+            promo["%s→%s" % (dates[i + 1][4:], dates[i][4:])] = round(
+                len(set(cur) & set(prev)) / len(prev) * 100, 1)
 
     rows = []
     for code, c in cands.items():
-        name = (c.get("name") or "").strip()
-        up = name.upper()
-        if "ST" in up or name.startswith("退") or len(code) != 6:
+        name = str(c.get("name") or "").strip()
+        if len(code) != 6 or not name:
+            continue
+        if "ST" in name.upper() or name.startswith("退"):
             continue
 
-        best, zt_days = None, 0
-        for i, d in enumerate(dates):               # i=0 是最近的一天
+        zt_days, best = 0, None
+        for d in dates:
             it = pools[d].get(code)
             if it:
                 zt_days += 1
-                if best is None:
-                    best = it
+                best = best or it
         src = best or {}
 
-        lhb_net, on_board, lhb_times = 0.0, False, 0
+        lhb = None
         for d in dates:
-            hit = lhbs[d].get(code)
-            if hit:
-                on_board = True
-                lhb_times += hit["times"]
-                if abs(hit["net"]) > abs(lhb_net):
-                    lhb_net = hit["net"]
+            if code in lhbs[d]:
+                cur = lhbs[d][code]
+                if lhb is None or abs(cur["net"]) > abs(lhb["net"]):
+                    lhb = cur
+                    lhb["_d"] = d
+        seat = None
+        for d in dates[:SEAT_LOOKBACK]:
+            cur = seats[d].get(code)
+            if cur and (seat is None or abs(cur["net_total"]) > abs(seat["net_total"])):
+                seat = cur
+                seat["_d"] = d
 
-        cap = src.get("cap")
+        capinfo = caps.get(code, {})
+        cap = capinfo.get("cap") or src.get("cap_pool") or c.get("cap_mx")
+        float_cap = capinfo.get("float_cap") or src.get("float_cap") or (lhb or {}).get("float_cap")
+
         p = {
-            "code": code, "name": name or src.get("name", ""),
-            "price": c.get("price") or src.get("price") or 0,
-            "pct": src.get("pct", c.get("pct", 0)),
-            "turnover": src.get("turnover", c.get("turnover", 0)),
-            "cap": cap if cap else None,
-            "float_cap": src.get("float_cap"),
-            "industry": src.get("industry", ""),
-            "lianban": src.get("lianban", 0),
-            "days": src.get("days", 0), "boards": src.get("boards", 0),
-            "seal_fund": src.get("seal_fund", 0),
-            "first_seal": src.get("first_seal", 0),
-            "last_seal": src.get("last_seal", 0),
-            "open_times": src.get("open_times", 0),
-            "zt_days": zt_days, "on_board": on_board, "lhb_times": lhb_times,
-            "lhb_net": yd(lhb_net) or 0.0,
+            "code": code, "name": name,
+            "price": capinfo.get("close") or c.get("price") or src.get("price") or 0,
+            "pct": src.get("pct", c.get("pct", 0)) or (capinfo.get("chg") or 0),
+            "turnover": src.get("turnover", c.get("turnover", 0)) or (lhb or {}).get("turnover", 0),
+            "cap": cap, "float_cap": float_cap,
+            "pe": capinfo.get("pe"), "pb": capinfo.get("pb"),
+            "industry": src.get("industry") or c.get("industry_mx") or capinfo.get("board", ""),
+            "concepts": (c.get("concepts") or "")[:120],
+            "lianban": src.get("lianban", 0), "days": src.get("days", 0),
+            "boards": src.get("boards", 0), "seal_fund": src.get("seal_fund"),
+            "first_seal": src.get("first_seal", 0), "open_times": src.get("open_times", 0),
+            "zt_days": zt_days, "seal_date": dates[0],
+            "on_board": bool(lhb), "lhb_net": (lhb or {}).get("net", 0.0),
+            "lhb_buy": (lhb or {}).get("buy"), "lhb_sell": (lhb or {}).get("sell"),
+            "lhb_deal_ratio": (lhb or {}).get("deal_ratio"),
+            "lhb_reason": (lhb or {}).get("reason", ""),
+            "lhb_explain": (lhb or {}).get("explain", ""),
+            "lhb_date": (lhb or {}).get("_d"),
+            "org_cnt": (lhb or {}).get("org_cnt", 0),
+            "org_dir": (lhb or {}).get("org_dir", ""),
+            "org_net": (seat or {}).get("org"), "north_net": (seat or {}).get("north"),
+            "hot_net": (seat or {}).get("hot"),
+            "top_buy": (seat or {}).get("top_buy", []), "top_sell": (seat or {}).get("top_sell", []),
+            "seat_org_win": (seat or {}).get("org_win"),
+            "seat_date": (seat or {}).get("_d"),
         }
-        if zt_days == 0 and not on_board:           # 两个信号都没有，不必上榜
-            continue
+        p["tier"] = tier_of(max(p["zt_days"], p["lianban"], p["boards"]))
 
-        p["hard"] = hard_hit(p)
-        p["hard_met"] = sum(1 for v in p["hard"].values() if v is True)
-        p["hard_total"] = sum(1 for v in p["hard"].values() if v is not None)
-        p["score"] = score(p)
-        p["seal"] = round(seal_strength(p) * 100)
+        hard = {"zt": p["zt_days"] > 0, "lhb": p["on_board"],
+                "cap": None if not p["cap"] else p["cap"] <= MAX_CAP_YI}
+        p["hard_met"] = sum(1 for v in hard.values() if v is True)
+        p["hard_total"] = sum(1 for v in hard.values() if v is not None)
+        p["hard_full"] = p["hard_met"] == 3
+        p["score"], p["score_detail"] = score_row(p)
+        p["seal_score"] = round(seal_strength(p) * 100)
         rows.append(p)
 
     rows.sort(key=lambda x: (x["hard_met"], x["score"]), reverse=True)
-    return rows, dates
+
+    tiers = {}
+    for r in rows:
+        if r["zt_days"] <= 0:
+            continue
+        t = tiers.setdefault(r["tier"], {"n": 0, "sum": 0.0, "best": None})
+        t["n"] += 1
+        t["sum"] += r["score"]
+        mb = max(r["lianban"], r["boards"], 1)
+        if not t["best"] or mb > t["best"]["mb"]:
+            t["best"] = {"code": r["code"], "name": r["name"], "mb": mb}
+    for t in tiers.values():
+        t["avg"] = round(t["sum"] / t["n"], 1) if t["n"] else 0
+        t.pop("sum", None)
+
+    today = datetime.now(CN_TZ).strftime("%Y%m%d")
+    lhb_pending = (today in dates) and (datetime.now(CN_TZ).hour < LHB_PUBLISH_HOUR) \
+        and not lhbs.get(today)
+
+    meta = {
+        "dates": dates, "latest": latest, "total": len(rows),
+        "passed": sum(1 for r in rows if r["hard_full"]),
+        "generated": datetime.now(CN_TZ).strftime("%Y-%m-%d %H:%M:%S"),
+        "mx_ok": mx_ok, "mx_msg": mx_msg, "promo": promo,
+        "lhb_pending": lhb_pending,
+        "industries": _industry_stat(rows),
+    }
+    return rows, tiers, meta
 
 
-def radar(refresh=False):
+def _industry_stat(rows, top=8):
+    agg = {}
+    for r in rows:
+        if r["zt_days"] <= 0:
+            continue
+        k = r["industry"] or "其他"
+        a = agg.setdefault(k, {"n": 0, "score": 0.0})
+        a["n"] += 1
+        a["score"] += r["score"]
+    out = [{"industry": k, "n": v["n"], "avg": round(v["score"] / v["n"], 1)}
+           for k, v in agg.items()]
+    out.sort(key=lambda x: (-x["n"], -x["avg"]))
+    return out[:top]
+
+
+# ============================== 9. 快照兜底 + 后台刷新 ==============================
+
+def save_snapshot(rows, tiers, meta):
+    try:
+        SNAP_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = SNAP_FILE.with_suffix(".tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({"rows": rows, "tiers": tiers, "meta": meta,
+                       "saved_at": datetime.now(CN_TZ).isoformat()}, f, ensure_ascii=False)
+        os.replace(tmp, SNAP_FILE)
+    except Exception as e:                          # noqa: BLE001
+        print("SNAP_SAVE_ERR", repr(e)[:120])
+
+
+def load_snapshot():
+    try:
+        with open(SNAP_FILE, encoding="utf-8") as f:
+            d = json.load(f)
+        print("SNAP_LOADED", d["meta"].get("latest"), len(d["rows"]))
+        return d
+    except Exception:                               # noqa: BLE001
+        return None
+
+
+def do_refresh(force=False):
     now = time.time()
     with _lock:
-        fresh = _RADAR["ts"] and (now - _RADAR["ts"] < CACHE_SECONDS)
-        if fresh and not refresh:
-            return dict(_RADAR)
+        fresh = _STATE["ts"] and (now - _STATE["ts"] < CACHE_SECONDS) and not force
+        # 失败后 15 秒内不再重试，避免接口全挂时每个页面请求都猛打一遍上游
+        throttled = now - _STATE["last_try"] < 15
+        if fresh or throttled or _STATE["refreshing"]:
+            return False
+        _STATE["refreshing"] = True
+        _STATE["last_try"] = now
     try:
-        rows, dates = build_radar()
+        rows, tiers, meta = build_radar()
         with _lock:
-            _RADAR.update({"ts": now, "data": rows,
-                           "meta": {"dates": dates,
-                                    "total": len(rows),
-                                    "passed": sum(1 for r in rows if r["hard_met"] == r["hard_total"] == 3),
-                                    "generated": datetime.now(CN_TZ).strftime("%Y-%m-%d %H:%M:%S"),
-                                    "mx_used": bool(mx_candidates())},
-                           "source": "妙想选股 + 东方财富公开数据", "error": None})
+            _STATE.update({"ts": time.time(), "data": rows, "tiers": tiers,
+                           "meta": meta, "source": "妙想选股 + 东方财富公开数据",
+                           "error": None})
+        save_snapshot(rows, tiers, meta)
+        print("REFRESH_OK", meta["latest"], meta["total"], "只")
     except Exception as e:                          # noqa: BLE001
+        err = "%s: %s" % (type(e).__name__, str(e)[:200])
+        print("REFRESH_ERR", err)
         with _lock:
-            _RADAR["error"] = "%s: %s" % (type(e).__name__, str(e)[:200])
-            _RADAR["ts"] = now if not _RADAR["ts"] else _RADAR["ts"]
+            _STATE["error"] = err
+            if not _STATE["ts"]:
+                snap = load_snapshot()
+                if snap:
+                    _STATE.update({"ts": 0.0, "data": snap["rows"], "tiers": snap["tiers"],
+                                   "meta": snap["meta"], "source": "内置快照（上次成功收盘数据）"})
+    finally:
+        with _lock:
+            _STATE["refreshing"] = False
+
+
+def refresher():
+    while True:
+        do_refresh(force=True)
+        time.sleep(CACHE_SECONDS)
+
+
+threading.Thread(target=refresher, daemon=True).start()
+
+
+def view():
     with _lock:
-        return dict(_RADAR)
+        st = dict(_STATE)
+    if not st["data"]:
+        do_refresh()                        # 冷启动：后台线程没跑起来时同步补一次
+        with _lock:
+            st = dict(_STATE)
+    if not st["data"]:
+        snap = load_snapshot()              # 仍为空：落到内置快照，保证页面不空白
+        if snap:
+            st.update({"data": snap["rows"], "tiers": snap["tiers"], "meta": snap["meta"],
+                       "source": "内置快照（上次成功收盘数据）"})
+    return st
 
 
-# ---------------------------------------------------------------- 6. 路由与页面
+# ============================== 10. 路由 ==============================
 
-API = "/api/radar"
-
-
-@app.get(API)
-def api_radar(refresh: int = 0):
-    st = radar(refresh=bool(refresh))
-    out = []
-    for r in st["data"][:60]:
-        out.append({k: v for k, v in r.items() if k not in ("hard",)})
+@app.get("/api/radar")
+def api_radar():
+    st = view()
+    keep = ("code", "name", "price", "pct", "turnover", "cap", "float_cap", "pe", "pb",
+            "industry", "tier", "lianban", "days", "boards", "zt_days", "seal_fund",
+            "first_seal", "open_times", "seal_score", "on_board", "lhb_net", "lhb_buy",
+            "lhb_sell", "lhb_deal_ratio", "lhb_reason", "lhb_explain", "lhb_date",
+            "org_cnt", "org_dir", "org_net", "north_net", "hot_net", "seat_org_win",
+            "concepts",
+            "top_buy", "top_sell", "seat_date", "score", "score_detail",
+            "hard_met", "hard_total", "hard_full")
+    out = [{k: r[k] for k in keep if k in r} for r in st["data"][:80]]
     return JSONResponse({"generated": st["meta"].get("generated"),
-                         "dates": st["meta"].get("dates"),
+                         "dates": st["meta"].get("dates"), "latest": st["meta"].get("latest"),
                          "source": st["source"], "error": st["error"],
-                         "passed": st["meta"].get("passed"),
-                         "total": st["meta"].get("total"),
-                         "mx_used": st["meta"].get("mx_used"),
-                         "list": out})
+                         "refreshing": st["refreshing"], "total": st["meta"].get("total"),
+                         "passed": st["meta"].get("passed"), "mx_ok": st["meta"].get("mx_ok"),
+                         "mx_msg": st["meta"].get("mx_msg"), "promo": st["meta"].get("promo"),
+                         "lhb_pending": st["meta"].get("lhb_pending"),
+                         "industries": st["meta"].get("industries"),
+                         "tiers": st["tiers"], "list": out})
+
+
+@app.get("/api/health")
+def api_health():
+    with _lock:
+        return {"ts": _STATE["ts"], "rows": len(_STATE["data"]),
+               "latest": _STATE["meta"].get("latest"), "error": _STATE["error"],
+               "refreshing": _STATE["refreshing"], "snapshot": SNAP_FILE.exists()}
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -502,98 +916,423 @@ def index():
     return PAGE
 
 
-# ---------------------------------------------------------------- 7. 前端
+# ============================== 12. 策略选股（善水模型） ==============================
+#
+# 模板来自用户提供的善水科技(301190) 2026-09-30 截图实测值：
+#   涨幅20.01%(20cm涨停) / 换手7.95%(实换手16.71%) / 量比1.25 / 总市值77.12亿
+#   流通市值65.34亿 / 5日涨幅75.61% / 最高价35.93创52周新高 / MA5 26.60>MA10 22.92>MA20 20.65
+#   主力净流入3210万、5日净流入1.21亿
+# 实现思路：6 条全满足查一次得"严格命中"；每次去掉一条各查一次，
+#           该结果减去严格命中即"只差这一条"的接近信号，天然给出"差的那一条"。
+# 依赖：均线/MACD/资金流/创52周新高这些字段只有妙想能按条件过滤
+#      （东方财富的 K 线接口 push2his 在本运行环境被服务端断连），故此模块必须有 MX_APIKEY。
+
+def mx_field(row, names):
+    """按候选列名从妙想一行里取值（内部走 mx_pick：精确 > 前缀 > 包含）"""
+    return mx_pick(row, names)
+
+
+def _pick_main(row, want_sum=True):
+    """主力净额有两列：当日「主力净额(不含暗盘)(元)」与区间「主力净额合计{...|...}」，
+    标题只差「合计」两字，必须显式区分，否则会把当日值当成 5 日合计。"""
+    best = ''
+    for k, v in row.items():
+        ks = str(k)
+        if '主力净额' not in ks or v in (None, ''):
+            continue
+        if (('合计' in ks) or ('|' in ks)) == want_sum:
+            if not best or len(ks) < len(best):
+                best = ks
+    return row.get(best, '') if best else ''
+
+
+def norm_row(row):
+    """把妙想一行压成策略页要用的字段；num/yi 已能解析「3.24亿」「1446.61万」这类中文单位"""
+    code = ''.join(c for c in str(mx_field(row, ['SECURITY_CODE', '股票代码', '代码', '证券代码']))
+                   if c.isdigit())
+    name = str(mx_field(row, ['SECURITY_SHORT_NAME', 'SECURITY_NAME_ABBR', '股票简称', '名称',
+                             'CUSTOM_FORMAT_STOCK_NAME'])).strip()
+    if len(code) != 6 or not name:
+        return None
+    return {
+        'code': code, 'name': name,
+        'price': round(num(mx_field(row, ['NEWEST_PRICE', '最新价', '收盘价', '现价'])), 2),
+        'pct': round(num(mx_field(row, ['CHG', '涨跌幅', '涨幅'])), 2),
+        'turnover': round(num(mx_field(row, ['TURNOVER_RATE', '换手率', 'HSL'])), 2),
+        'liangbi': round(num(mx_field(row, ['LIANGBI', '量比'])), 2),
+        'cap': yi(mx_field(row, ['TOAL_MARKET_VALUE', 'TOTAL_MARKET_CAP', '总市值', '市值'])),
+        'float_cap': yi(mx_field(row, ['CIRCULATION_MARKET_VALUE', '流通市值'])),
+        'ma5': round(num(mx_field(row, ['5日均线', 'MA5'])), 2) or None,
+        'ma10': round(num(mx_field(row, ['10日均线', 'MA10'])), 2) or None,
+        'ma20': round(num(mx_field(row, ['20日均线', 'MA20'])), 2) or None,
+        'main_net': yi(_pick_main(row, want_sum=False)),
+        'main_net_5d': yi(_pick_main(row, want_sum=True)),
+        'chg5d': round(num(mx_field(row, ['5日区间涨跌幅', '区间涨跌幅', 'INTERVAL_CHG', '5日涨幅'])), 2),
+        'peak': round(num(mx_field(row, ['最高价', '52周最高价', '区间最高价'])), 2) or None,
+        'concepts': str(mx_field(row, ['STYLE_CONCEPT', '概念', '题材', '个股题材']))[:80],
+    }
+
+
+STRATEGY_NAME = "善水策略"
+STRAT_MAX = 200                        # 单次问句要求返回的只数上限
+COND_KEYS = ["C1涨停确认", "C2均线多头", "C3抛压衰竭", "C4量能与换手", "C5小市值", "C6阶段强势创新高"]
+
+COND_DESC = {
+    "C1涨停确认": "最近一个交易日涨停（主板10%／创业科创20%，由妙想按涨停过滤）",
+    "C2均线多头": "5日均线 > 10日均线 > 20日均线（善水科技当日 26.60 > 22.92 > 20.65）",
+    "C3抛压衰竭": "当日主力净额 > 0 且 近5个交易日主力净额合计 > 0（对应参考图的「D-1还有资金流出」）",
+    "C4量能与换手": "换手率 6%~25% 且 量比 1~3（善水科技 7.95% / 1.25）",
+    "C5小市值": "总市值 <= 100 亿 且 流通市值 <= 80 亿（善水科技 77.12 / 65.34）",
+    "C6阶段强势创新高": "5日区间涨幅 > 50% 且 最高价创52周新高（善水科技 75.61%）",
+}
+
+MISS_WHY = {
+    "C1涨停确认": lambda r: "未涨停",
+    "C2均线多头": lambda r: "均线未多头（MA5 %s / MA10 %s / MA20 %s）" % (
+        _sv(r["ma5"]), _sv(r["ma10"]), _sv(r["ma20"])),
+    "C3抛压衰竭": lambda r: "D-1还有资金流出（主力净额 %s，5日合计 %s）" % (
+        _sv(r["main_net"], "亿"), _sv(r["main_net_5d"], "亿")),
+    "C4量能与换手": lambda r: "量能不符（换手 %s%%，量比 %s）" % (_sv(r["turnover"]), _sv(r["liangbi"])),
+    "C5小市值": lambda r: "市值超区间（总市值 %s亿，流通 %s亿）" % (_sv(r["cap"]), _sv(r["float_cap"])),
+    "C6阶段强势创新高": lambda r: "强度或新高不够（5日涨幅 %s%%，最高价 %s，52周新高 %s）" % (
+        _sv(r["chg5d"]), _sv(r["peak"]), "是" if r.get("new_high_52w") else "否"),
+}
+
+
+def mx_post(q, tries=3):
+    """带频控退避的妙想查询：status=112(频率过高) 按 8s/16s 退避重试，113(日限额) 直接降级。"""
+    key = os.getenv("MX_APIKEY")
+    if not key:
+        raise RuntimeError("策略选股依赖妙想的均线／资金流／新高字段，请先配置 MX_APIKEY")
+    last = None
+    for i in range(tries):
+        obj = http_json(MX_URL, payload={"keyword": q}, timeout=60, tries=1,
+                        headers={**MX_HEADERS, "apikey": key}, method="POST")
+        st = obj.get("status")
+        if st == 0:
+            biz = (obj.get("data") or {}).get("code")
+            if biz in (113, "113"):
+                MX_LIMITED.set()
+                raise RuntimeError("妙想日调用次数已达上限(code=113)")
+            return mx_rows_of(obj)
+        msg = str(obj.get("message") or "")
+        last = RuntimeError("妙想 status=%s %s" % (st, msg[:80]))
+        if "频率" in msg or st in (112, "112"):
+            wait = 8 * (i + 1)
+            print("MX_RATE_LIMIT 第%d次，退避 %ds" % (i + 1, wait))
+            time.sleep(wait)
+            continue
+        raise last
+    raise last
+
+
+def _sv(v, suf=""):
+    return "--" if v in (None, "", 0) else "%s%s" % (v, suf)
+
+
+def _rows_of(q):
+    out = []
+    for r in mx_post(q):
+        n = norm_row(r)
+        if n:
+            out.append(n)
+    return out
+
+
+# 结构池：只用便宜且当日不变的条件过滤（涨停 + 市值 + 换手/量比），指标列一并取回，AND 逻辑本地算
+Q_POOL = ("筛选最近一个交易日涨停的A股，同时满足总市值小于等于100亿元、流通市值小于等于80亿元、"
+          "换手率大于等于6%%且小于等于25%%、量比大于等于1且小于等于3，"
+          "排除ST股票、*ST股票和退市股票，返回不超过%d只，"
+          "包含股票代码、股票简称、最新价、涨跌幅、换手率、量比、总市值、流通市值、"
+          "5日均线、10日均线、20日均线、主力净额、5日主力净额合计、5日区间涨跌幅、最高价、概念题材"
+          % (STRAT_MAX,))
+
+# 52周新高只能作为过滤条件、取不回字段值，故单独确认一次
+Q_NEWHIGH = ("筛选最近一个交易日涨停且最高价创52周新高的A股，排除ST股票、*ST股票和退市股票，"
+             "返回不超过%d只，包含股票代码、股票简称、涨跌幅、最高价" % STRAT_MAX)
+
+
+def evaluate(r, new_high_codes):
+    """本地逐条判定 6 个条件"""
+    ma5, ma10, ma20 = r["ma5"], r["ma10"], r["ma20"]
+    return {
+        "C1涨停确认": True,                       # 结构池本身就是按涨停筛出来的
+        "C2均线多头": bool(ma5 and ma10 and ma20 and ma5 > ma10 > ma20),
+        "C3抛压衰竭": bool((r["main_net"] or 0) > 0 and (r["main_net_5d"] or 0) > 0),
+        "C4量能与换手": 6 <= (r["turnover"] or 0) <= 25 and 1 <= (r["liangbi"] or 0) <= 3,
+        "C5小市值": bool(r["cap"] and r["cap"] <= 100 and (r["float_cap"] or 9e9) <= 80),
+        "C6阶段强势创新高": (r["chg5d"] or 0) > 50 and r["code"] in new_high_codes,
+    }
+
+
+def build_strategy():
+    pool = _rows_of(Q_POOL)
+    time.sleep(6)                                  # 频控友好：两次查询之间留间隔
+    nh_codes = {r["code"] for r in _rows_of(Q_NEWHIGH)}
+
+    strict, near, counts = [], [], {k: 0 for k in COND_KEYS}
+    for r in pool:
+        r["new_high_52w"] = r["code"] in nh_codes
+        res = evaluate(r, nh_codes)
+        r["pass"] = res
+        for k, v in res.items():
+            if v:
+                counts[k] += 1
+        miss = [k for k, v in res.items() if not v]
+        if not miss:
+            strict.append(r)
+        elif len(miss) == 1:
+            item = dict(r)
+            item["miss"] = miss[0]
+            item["miss_reason"] = MISS_WHY[miss[0]](r)
+            near.append(item)
+
+    strict.sort(key=lambda x: (-x["pct"], x["code"]))
+    near.sort(key=lambda x: (-x["pct"], x["code"]))
+    return strict, near, counts, len(pool), sorted(nh_codes)
+
+
+def strategy_view(force=False):
+    now = time.time()
+    key = "strategy_" + datetime.now(CN_TZ).strftime("%Y%m%d%H")
+    if not force:
+        ok, val = _cache_get(key)
+        if ok:
+            return val
+    strict, near, counts, pool_n, nh = build_strategy()
+    val = {
+        "name": STRATEGY_NAME,
+        "generated": datetime.now(CN_TZ).strftime("%Y-%m-%d %H:%M:%S"),
+        "conds": COND_KEYS, "cond_desc": COND_DESC,
+        "strict": strict, "near": near, "cond_count": counts,
+        "pool": pool_n, "new_high": len(nh),
+        "note": ("严格命中=6条全满足；最接近信号=只差1条。6 条判定全部在本地完成"
+                 "（妙想只查 2 次：结构池 + 52周新高确认），名单不随查询顺序或频控波动。其中 C1/C4/C5 已作为入池过滤条件，家数恒等于结构池数量，只有 C2/C3/C6 是池内增量判定。"
+                 "胜率需逐日历史回测，东方财富 K 线接口在本环境不可用，故未计算。"),
+    }
+    _cache_put(key, val, CACHE_SECONDS * 10, now)
+    return val
+
+
+@app.get("/api/strategy")
+def api_strategy(refresh: int = 0):
+    try:
+        return JSONResponse(strategy_view(force=bool(refresh)))
+    except Exception as e:                          # noqa: BLE001
+        return JSONResponse({"error": "%s: %s" % (type(e).__name__, str(e)[:200]),
+                             "strict": [], "near": []}, status_code=200)
+
+
+@app.get("/strategy", response_class=HTMLResponse)
+def page_strategy():
+    return STRAT_PAGE
+
+
+# ============================== 11. 前端 ==============================
 
 PAGE = r"""<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-<meta charset="utf-8">
+<html lang="zh-CN"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>妖股雷达</title>
+<title>妖股雷达 · A股短线打板筛选台</title>
 <style>
-:root{--bg:#0d1117;--card:#161b22;--line:#21262d;--tx:#e6edf3;--sub:#8b949e;--up:#f0524f;--dn:#2ea043;--gold:#d4a24a}
+:root{--bg:#07080b;--card:#12151b;--line:#1f242d;--tx:#e9edf3;--sub:#8790a0;--up:#f0524f;--dn:#2ea043;--gold:#d4a24a}
 *{box-sizing:border-box;margin:0;padding:0}
-body{background:var(--bg);color:var(--tx);font-family:-apple-system,"PingFang SC","Microsoft YaHei",sans-serif;padding:14px}
-h1{font-size:20px;display:flex;align-items:center;gap:8px}
-.rule{color:var(--sub);font-size:12px;line-height:1.7;margin:6px 0 2px}
+body{background:var(--bg);color:var(--tx);font:14px/1.5 -apple-system,"PingFang SC","Microsoft YaHei",sans-serif;padding:14px;max-width:1360px;margin:0 auto}
+h1{font-size:19px}
+.rule{color:var(--sub);font-size:12px;margin:5px 0 12px;line-height:1.75}
 .rule b{color:var(--gold);font-weight:600}
-.bar{display:flex;justify-content:space-between;align-items:center;color:var(--sub);font-size:12px;margin:8px 0 14px;flex-wrap:wrap;gap:6px}
-.bar button{background:#1f2630;color:var(--tx);border:1px solid var(--line);border-radius:6px;padding:5px 12px;font-size:12px;cursor:pointer}
-.dot{width:7px;height:7px;border-radius:50%;background:var(--dn);display:inline-block;margin-right:5px}
-.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(258px,1fr));gap:11px}
-.card{background:var(--card);border:1px solid var(--line);border-radius:11px;padding:13px;position:relative;transition:.15s}
-.card:hover{border-color:#3d444d;transform:translateY(-1px)}
-.full{border-color:rgba(212,162,74,.55)}
-.rank{position:absolute;right:12px;top:11px;font-size:11px;color:var(--sub)}
-.rank i{color:var(--gold);font-style:normal;font-weight:700}
-.nm{font-size:16px;font-weight:700}
-.cd{font-size:11px;color:var(--sub);margin-top:2px;letter-spacing:.5px}
-.sc{display:flex;align-items:baseline;gap:9px;margin:9px 0 10px}
-.sc em{font-style:normal;font-size:25px;font-weight:800;color:var(--gold)}
-.sc span{font-size:11px;color:var(--sub)}
-.pc{font-weight:700;font-size:14px}
+.tiers{display:flex;gap:8px;overflow-x:auto;padding-bottom:10px;margin-bottom:6px}
+.tier{flex:0 0 auto;background:var(--card);border:1px solid var(--line);border-radius:9px;padding:8px 12px;font-size:12px;min-width:118px}
+.tier em{font-style:normal;font-weight:700;font-size:16px;color:var(--gold);display:block;margin-top:3px}
+.tier i{font-style:normal;color:var(--sub);font-size:11px}
+.bar{display:flex;justify-content:space-between;align-items:center;color:var(--sub);font-size:12px;margin:6px 0;gap:8px;flex-wrap:wrap}
+.bar button{background:#1b2029;color:var(--tx);border:1px solid var(--line);border-radius:6px;padding:5px 11px;font-size:12px;cursor:pointer}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(330px,1fr));gap:10px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:11px;padding:12px}
+.full{border-color:rgba(212,162,74,.5)}
+.hd{display:flex;justify-content:space-between;align-items:flex-start}
+.nm{font-size:16px;font-weight:700}.cd{font-size:11px;color:var(--sub);letter-spacing:.4px}
+.rk{font-size:11px;color:var(--sub);text-align:right}
+.rk i{font-style:normal;color:var(--gold);font-weight:700;font-size:17px;display:block}
+.ln{display:flex;gap:6px;flex-wrap:wrap;margin:7px 0 3px}
+.tag{font-size:10.5px;padding:2px 7px;border-radius:20px;background:#1b2029;color:#a9b2c1}
+.tag.g{background:rgba(212,162,74,.15);color:#e3bd76}
+.tag.n{background:rgba(46,160,67,.14);color:#68c98a}
+.sc{display:flex;align-items:baseline;gap:8px;margin:6px 0}
+.sc em{font-style:normal;font-size:24px;font-weight:800;color:var(--gold)}
+.sc span{font-size:11px;color:var(--sub)}.pc{font-weight:700;font-size:14px}
 .u{color:var(--up)}.d{color:var(--dn)}
-.row{display:flex;justify-content:space-between;font-size:12.5px;padding:3.5px 0;border-top:1px dashed var(--line)}
+.row{display:flex;justify-content:space-between;font-size:12.5px;padding:3px 0;border-top:1px dashed var(--line)}
 .row span{color:var(--sub)}
-.tag{display:inline-block;font-size:10.5px;padding:2px 7px;border-radius:20px;background:#1f2630;color:var(--sub);margin-top:7px}
-.hard{font-size:11px;color:var(--sub);margin-top:6px}
-.hard b{color:var(--dn);font-weight:600}.hard i{color:#e3724a;font-style:normal}
-.empty{padding:60px 10px;text-align:center;color:var(--sub);font-size:13px;line-height:2}
-.warn{background:rgba(227,114,74,.12);border:1px solid rgba(227,114,74,.4);color:#f0a878;border-radius:9px;padding:10px 12px;font-size:12px;margin-bottom:12px;line-height:1.6}
-</style>
-</head>
-<body>
-<h1>🔥 妖股雷达</h1>
-<div class="rule">硬条件：<b>近3交易日涨停</b> + <b>龙虎榜</b> + <b>总市值≤300亿</b><br>
-评分：涨幅 + 换手率 + 龙虎榜资金 + 近3日涨停次数 + 封板强弱</div>
-<div class="bar"><div><i class="dot"></i><span id="src">加载中…</span></div>
-<div><button onclick="load(1)">↻ 手动刷新</button></div></div>
-<div id="warn"></div><div id="out" class="grid"></div>
+.sum{background:#0e1116;border:1px solid var(--line);border-radius:8px;padding:8px 10px;margin-top:8px;font-size:11.5px;color:#a9b2c1;line-height:1.7}
+.sum b{color:#dfe5ee;font-weight:600}
+.seat{color:#95a0b1;font-size:11px}
+.why{margin-top:6px;font-size:11px;color:#b58a4a;line-height:1.6}
+.warn{background:rgba(227,114,74,.1);border:1px solid rgba(227,114,74,.35);color:#f0a878;border-radius:9px;padding:9px 12px;font-size:12px;margin-bottom:12px;line-height:1.7}
+.note{background:rgba(212,162,74,.08);border:1px solid rgba(212,162,74,.28);color:#e3c48a;border-radius:9px;padding:9px 12px;font-size:12px;margin-bottom:12px}
+.empty{padding:56px 10px;text-align:center;color:var(--sub);line-height:2}
+.split{display:flex;justify-content:space-between;font-size:11px;color:var(--sub);padding-top:5px}
+</style></head><body>
+<h1>妖股雷达 <a href="/strategy" style="font-size:12px;font-weight:400">策略选股 · 善水模型 →</a></h1>
+<div class="rule">硬条件：<b>近3交易日涨停</b> + <b>龙虎榜</b> + <b>总市值≤300亿</b>　评分：<b>封板强弱20</b> + <b>连板梯队20</b> + <b>龙虎榜资金20</b> + <b>涨幅15</b> + <b>换手率15</b> + <b>机构席位10</b><br>数据源：妙想选股 + 东方财富公开数据（涨停池 / 龙虎榜 / 席位明细 / 估值分析）</div>
+<div class="bar"><div id="src">加载中…</div><div>
+<button onclick="onlyFull=!onlyFull;render()">只看硬条件全中</button>
+<button onclick="sortMode=sortMode==='score'?'lhb':'score';render()">按评分/龙虎榜</button>
+<button onclick="load(1)">刷新</button></div></div>
+<div id="msg"></div><div id="tiers" class="tiers"></div><div id="out" class="grid"></div>
 <script>
-const fmt=(v,suf='')=>(v===null||v===undefined||v===''?'--':v+suf);
-const yi=v=>(v===null||v===undefined||v===0)?'--':Math.abs(v).toFixed(2)+'亿';
+let RAW=[],TIERS={},onlyFull=false,sortMode='score';
+const V=v=>(v===null||v===undefined||v==='')?'--':v;
+const E=v=>(v===null||v===undefined||v===0)?'--':Math.abs(v).toFixed(2)+'亿';
+const S=v=>v>0?('+'+v.toFixed(2)+'亿'):(v<0?('-'+Math.abs(v).toFixed(2)+'亿'):'0');
 function card(r,i){
-  const total=r.hard_total||3, met=r.hard_met||0;
-  const full=met===total;
-  const pcs=(r.pct||0).toFixed(2);
-  const cls=(r.pct||0)>=0?'u':'d';
-  const sign=(r.pct||0)>=0?'+':'';
-  const net=(r.lhb_net||0);
-  const netTxt=r.on_board?(net>=0?'+':'-')+yi(net):'未上榜';
-  const nb=r.days&&r.boards?`${r.days}天${r.boards}板`:(r.lianban?`${r.lianban}连板`:'--');
-  return `<div class="card${full?' full':''}">
-    <div class="rank">#<i>${i+1}</i></div>
-    <div class="nm">${r.name}</div><div class="cd">${r.code}</div>
-    <div class="sc"><em>${r.score}</em><span>分</span>
-      <span class="pc ${cls}">${sign}${pcs}%</span></div>
-    <div class="hard">${full?'✓ 硬条件':`⚠ 硬条件 <i>${met}/${total}</i>`}
-      ${r.cap===null||r.cap===0?' · 市值未知':''}${r.zt_days===0?' · 近3日未涨停':''}${!r.on_board?' · 未上龙虎榜':''}</div>
-    <div class="row"><span>总市值</span><b>${fmt(r.cap,'亿')}</b></div>
-    <div class="row"><span>最新价</span><b>${fmt(r.price)}</b></div>
-    <div class="row"><span>换手率</span><b>${fmt((r.turnover||0).toFixed(2),'%')}</b></div>
-    <div class="row"><span>龙虎榜净额</span><b class="${net>=0?'u':'d'}">${netTxt}</b></div>
-    <div class="row"><span>近3日涨停</span><b>${r.zt_days}次 · ${nb}</b></div>
-    <div class="row"><span>封板强弱</span><b>${r.seal}分 · 炸板${r.open_times}次</b></div>
-    <div class="row"><span>封单</span><b>${yi(r.seal_fund)}</b></div>
-    <div class="tag">${r.industry||'—'}</div></div>`;
+  const p=(r.pct||0)>=0?'u':'d', sign=(r.pct||0)>=0?'+':'';
+  const hh=r.hard_full?'✓ 三项全中':('⚠ 硬条件 '+r.hard_met+'/'+r.hard_total+(r.cap?'':' · 市值未知'));
+  const nb=r.days&&r.boards?(r.days+'天'+r.boards+'板'):(r.lianban?r.lianban+'连板':'--');
+  const fs=r.first_seal?String(r.first_seal).padStart(6,'0').replace(/(\d\d)(\d\d)\d\d/,'$1:$2'):'--';
+  const seats=(r.top_buy||[]).slice(0,3).map(x=>'<div class="seat">买 '+x.seat.slice(0,16)+' '+x.amt.toFixed(2)+'亿'+(x.net?' 净'+x.net.toFixed(2)+'亿':'')+'</div>').join('')
+             +(r.top_sell||[]).slice(0,2).map(x=>'<div class="seat">卖 '+x.seat.slice(0,16)+' '+x.amt.toFixed(2)+'亿</div>').join('');
+  return `<div class="card${r.hard_full?' full':''}">
+   <div class="hd"><div><div class="nm">${r.name}</div><div class="cd">${r.code}</div></div>
+     <div class="rank">#<i>${i+1}</i></div></div>
+   <div class="sc"><em>${r.score}</em><span>分</span><span class="pc ${p}">${sign}${(r.pct||0).toFixed(2)}%</span>
+     <span class="tag">${r.tier}</span></div>
+   <div class="ln"><span class="tag ${r.hard_full?'g':''}">${hh}</span>
+     ${r.on_board?`<span class="tag n">龙虎榜 ${S(r.lhb_net)}</span>`:'<span class="tag">未上龙虎榜</span>'}
+     ${r.org_cnt?`<span class="tag n">${r.org_cnt}家机构${r.org_dir}</span>`:''}</div>
+   ${(r.concepts||'').split('、').filter(Boolean).slice(0,4).map(x=>`<span class="tag">${x}</span>`).join(' ')}
+   <div class="row"><span>总市值 / 流通</span><b>${V(r.cap)}亿 / ${V(r.float_cap)}亿</b></div>
+   <div class="row"><span>最新价 / 换手</span><b>${V(r.price)} / ${V((r.turnover||0).toFixed(2))}%</b></div>
+   <div class="row"><span>近3日涨停 / 梯队</span><b>${r.zt_days}次 · ${nb}</b></div>
+   <div class="row"><span>封板强弱</span><b>${r.seal_score}分 · 首封${fs} · 炸板${r.open_times}次</b></div>
+   <div class="row"><span>封单 / 行业</span><b>${E(r.seal_fund)} · ${V(r.industry)}</b></div>
+   ${(r.org_net||r.north_net||r.hot_net)?`<div class="sum">席位净额：
+     <b>机构 ${S(r.org_net)}</b>　北向 ${S(r.north_net)}　游资 ${S(r.hot_net)}
+     ${r.seat_org_win?('<br>机构席位3日胜率 <b>'+r.seat_org_win+'%</b>'):''}
+     ${r.lhb_deal_ratio?('<br>龙虎榜成交占比 <b>'+r.lhb_deal_ratio+'%</b>'):''}
+     ${seats?'<br>'+seats:''}</div>`:''}
+   ${r.lhb_reason?`<div class="why">上榜原因：${r.lhb_reason}${r.lhb_date?('（'+r.lhb_date+'）'):''}</div>`:''}
+   <div class="split"><div>评分构成 ${Object.entries(r.score_detail||{}).map(([k,v])=>k+v).join(' · ')}</div>
+   <div>${(r.seat_date||r.lhb_date||'').replace(/(\d{4})(\d{2})(\d{2})/,'$2-$3')}</div></div></div>`;
+}
+function render(){
+  let l=RAW.slice();
+  if(onlyFull) l=l.filter(r=>r.hard_full);
+  l.sort(sortMode==='score'?(a,b=>b.score-a.score):(a,b=>(b.lhb_net||0)-(a.lhb_net||0)));
+  document.getElementById('out').innerHTML=l.length?l.map(card).join('')
+    :'<div class="empty">暂无符合条件的股票<br>休市日或条件过严，可点右上刷新</div>';
+}
+function tiersHtml(t){
+  const order=['首板','2板','3板','4板及以上'];
+  document.getElementById('tiers').innerHTML=order.filter(k=>t[k]).map(k=>{
+    const x=t[k],b=x.best?('<i>最高标 '+x.best.name+'('+x.best.mb+'板)</i>'):'';
+    return `<div class="tier">${k}<em>${x.n}只</em>均分 ${x.avg}${b?'<br>'+b:''}</div>`;
+  }).join('') || '<div class="tier">梯队<i>暂无涨停数据</i></div>';
 }
 async function load(refresh){
   document.getElementById('src').textContent='加载中…';
   try{
-    const d=await (await fetch('/api/radar?refresh='+(refresh?1:0))).json();
+    const d=await (await fetch('/api/radar?'+Date.now())).json();
+    RAW=d.list||[];TIERS=d.tiers||{};
     document.getElementById('src').textContent=
-      `${d.generated||''} · 共${d.total||0}只 · 硬条件全中${d.passed||0}只 · ${d.mx_used?'妙想选股':'纯涨停池'}`;
+      `${d.generated||''} · ${d.latest||''} · 候选${d.total||0}只 · 三项全中${d.passed||0}只 · ${d.source}`;
     let w='';
-    if(!d.mx_used) w+='当前未使用妙想选股（MX_APIKEY 未设置或调用失败），已降级为东方财富涨停池模式，榜单仍可用。<br>';
-    if(d.error) w+='数据刷新出错：'+d.error+'（展示的是上次成功的结果）';
-    document.getElementById('warn').innerHTML=w?`<div class="warn">${w}</div>`:'';
-    const list=d.list||[];
-    document.getElementById('out').innerHTML=list.length
-      ? list.map(card).join('')
-      : '<div class="empty">暂无符合条件的股票<br>休市日或条件过严，可稍后重试</div>';
+    if(d.error) w+=`<div class="warn">数据刷新失败：${d.error}<br>当前展示的是上次成功的快照，可能不是最新。</div>`;
+    if(d.refreshing && !RAW.length) w+='<div class="note">后台正在拉取数据（约 10–30 秒），请稍候再刷新。</div>';
+    if(!d.mx_ok) w+=`<div class="note">未使用妙想选股（${d.mx_msg||''}），已自动降级为东方财富涨停池模式，榜单仍可用。</div>`;
+    if(d.lhb_pending) w+='<div class="note">今日龙虎榜约 18:00 后披露，当前龙虎榜维度取最近已披露日。</div>';
+    document.getElementById('msg').innerHTML=w;
+    tiersHtml(TIERS);render();
   }catch(e){document.getElementById('src').textContent='加载失败：'+e}
 }
 load(0);setInterval(()=>load(0),60000);
-</script>
-</body>
-</html>"""
+</script></body></html>"""
+
+
+STRAT_PAGE = r"""<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>善水策略 · 选股结果</title>
+<style>
+:root{--bg:#07080b;--card:#12151b;--line:#1f242d;--tx:#e9edf3;--sub:#8790a0;--up:#f0524f;--gold:#d4a24a;--green:#3fb97a}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg);color:var(--tx);font:14px/1.55 -apple-system,"PingFang SC","Microsoft YaHei",sans-serif;padding:14px;max-width:1120px;margin:0 auto}
+a{color:#7aa7d8;text-decoration:none;font-size:12px}
+h2{font-size:18px;margin-bottom:2px}
+.sub{color:var(--sub);font-size:12px;margin-bottom:12px;line-height:1.7}
+.sec{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:12px 14px;margin-bottom:12px}
+.sec h3{font-size:14px;margin-bottom:9px;display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.badge{font-size:11px;padding:2px 9px;border-radius:20px;background:rgba(63,185,122,.15);color:var(--green);font-weight:600}
+.badge.n{background:rgba(212,162,74,.15);color:#e3bd76}
+table{width:100%;border-collapse:collapse;font-size:12.5px}
+th{text-align:left;color:var(--sub);font-weight:500;padding:6px 8px;border-bottom:1px solid var(--line);white-space:nowrap}
+td{padding:7px 8px;border-bottom:1px solid #171c24;vertical-align:top}
+tr:last-child td{border-bottom:0}
+.mono{font-family:ui-monospace,Menlo,Consolas,monospace;color:#aeb7c6;font-size:12px}
+.u{color:var(--up);font-weight:600}
+.nm{font-weight:600}
+.miss{color:#e39a5b;font-size:11.5px;line-height:1.5}
+.funnel{display:flex;gap:7px;flex-wrap:wrap;font-size:11.5px;color:var(--sub)}
+.funnel span{background:#171d26;border:1px solid var(--line);border-radius:7px;padding:4px 9px}
+.funnel b{color:var(--gold);font-weight:700}
+.tpl{display:grid;grid-template-columns:repeat(auto-fill,minmax(148px,1fr));gap:6px;font-size:12px}
+.tpl div{background:#171d26;border-radius:7px;padding:5px 9px;color:#aeb7c6}
+.tpl b{color:#dfe5ee;font-weight:600;float:right}
+.note{font-size:11.5px;color:#8f98a8;line-height:1.7}
+.warn{background:rgba(227,114,74,.1);border:1px solid rgba(227,114,74,.35);color:#f0a878;border-radius:9px;padding:10px 12px;font-size:12px;margin-bottom:12px}
+button{background:#1b2029;color:var(--tx);border:1px solid var(--line);border-radius:6px;padding:5px 12px;font-size:12px;cursor:pointer}
+.conds{font-size:11.5px;color:#9aa4b4;line-height:1.9}
+.conds b{color:#cfd6e2;font-weight:600}
+</style></head><body>
+<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">
+<a href="/">← 返回妖股雷达</a><button onclick="load(1)">重新筛选</button></div>
+<h2>📦 <span id="tt">善水策略</span> 选股结果</h2>
+<div class="sub" id="src">加载中…</div>
+<div id="msg"></div>
+<div id="box"></div>
+<div class="sec"><h3>策略条件定义</h3><div class="conds" id="defs"></div></div>
+<div class="sec"><h3>模板票基准值 · 善水科技 301190（2026-09-30 收盘）</h3>
+<div class="tpl">
+<div>涨幅<b>20.01%</b></div><div>换手/实换手<b>7.95%/16.71%</b></div><div>量比<b>1.25</b></div>
+<div>总市值<b>77.12亿</b></div><div>流通市值<b>65.34亿</b></div><div>5日涨幅<b>75.61%</b></div>
+<div>MA5/10/20<b>26.60/22.92/20.65</b></div><div>最高价<b>35.93(创52周新高)</b></div>
+<div>主力净额<b>+3210万</b></div><div>5日主力净额<b>+1.21亿</b></div><div>市净率<b>3.86</b></div>
+<div>成交额<b>5.10亿</b></div></div>
+<div class="note" style="margin-top:8px">基准值取自你提供的两张东方财富截图；阈值按该票当日取值反推并留出可复现区间，条件全部走妙想（东方财富 K 线接口 push2his 在云端被服务端断连，均线/MACD/资金流无法自建）。</div></div>
+<script>
+const E=v=>(v===null||v===undefined||v===0||v==='--')?'--':(Math.abs(v)>=1?v.toFixed(2):v)+'亿';
+const P=v=>(v===null||v===undefined)?'--':v;
+function tbl(rows,missMode){
+  if(!rows.length) return '<div class="note">无符合条件的标的</div>';
+  let h=missMode?'<table><tr><th>代码</th><th>名称</th><th>最新价</th><th>D0涨</th><th>总市值</th><th>5日涨</th><th>差的那一条</th></tr>'
+                :'<table><tr><th>代码</th><th>名称</th><th>最新价</th><th>D0涨</th><th>换手</th><th>量比</th><th>总市值</th><th>流通</th><th>5日涨</th><th>题材</th></tr>';
+  rows.forEach(r=>{
+    h=missMode? h+`<tr><td class="mono">${r.code}</td><td class="nm">${r.name}</td><td>${P(r.price)}</td>
+        <td class="u">+${P(r.pct)}%</td><td>${E(r.cap)}</td><td>${P(r.chg5d)}%</td>
+        <td class="miss"><b>${r.miss}</b> · ${r.miss_reason}</td></tr>`
+      : h+`<tr><td class="mono">${r.code}</td><td class="nm">${r.name}</td><td>${P(r.price)}</td>
+        <td class="u">+${P(r.pct)}%</td><td>${P(r.turnover)}%</td><td>${P(r.liangbi)}</td>
+        <td>${E(r.cap)}</td><td>${E(r.float_cap)}</td><td>${P(r.chg5d)}%</td>
+        <td class="miss">${(r.concepts||'').split('、').slice(0,4).join('、')}</td></tr>`;
+  });
+  return h+'</table>';
+}
+async function load(refresh){
+  document.getElementById('src').textContent='筛选中…（7 次妙想查询，约 20–60 秒）';
+  try{
+    const d=await (await fetch('/api/strategy?refresh='+(refresh?1:0))).json();
+    if(d.error){document.getElementById('src').textContent='';
+      document.getElementById('msg').innerHTML=`<div class="warn">策略选股失败：${d.error}</div>`;return;}
+    document.getElementById('tt').textContent=d.name;
+    document.getElementById('src').textContent=`${d.generated} · 结构池 ${d.pool} 只（52周新高 ${d.new_high} 只）· 严格命中 ${d.strict.length} 只 · 只差1条 ${d.near.length} 只`;
+    document.getElementById('defs').innerHTML=Object.entries(d.cond_desc).map(([k,v])=>`<div><b>${k}</b> — ${v}</div>`).join('');
+    document.getElementById('box').innerHTML=
+      `<div class="sec"><h3>✅ 严格命中（6/6 全满足）<span class="badge">${d.strict.length} 只</span></h3>${tbl(d.strict,false)}</div>
+       <div class="sec"><h3>🎯 最接近信号（5/6，只差1条）<span class="badge n">${d.near.length} 只</span></h3>${tbl(d.near,true)}</div>
+       <div class="sec"><h3>条件通过统计（结构池内满足该条的家数，越少说明该条越卡）</h3>
+         <div class="funnel">${Object.entries(d.cond_count).map(([k,v])=>`<span>${k} <b>${v}</b></span>`).join('')}</div>
+         <div class="note" style="margin-top:8px">${d.note}</div></div>`;
+  }catch(e){document.getElementById('src').textContent='加载失败：'+e}
+}
+load(0);
+</script></body></html>""
