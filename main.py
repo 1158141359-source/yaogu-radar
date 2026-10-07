@@ -641,7 +641,7 @@ def score_row(p):
 
     detail = {"涨幅": round(s_pct, 1), "换手": round(s_turn, 1), "连板梯队": round(s_ladder, 1),
               "龙虎榜资金": round(s_net, 1), "封板强弱": round(s_seal, 1), "机构席位": round(s_org, 1)}
-    return clamp(sum(detail.values()), 0, 100), detail
+    return round(clamp(sum(detail.values()), 0, 100), 1), detail
 
 
 # ============================== 8. 组装 ==============================
@@ -670,6 +670,8 @@ def build_radar():
             e.setdefault("turnover", it["turnover"])
 
     caps = get_caps(list(cands), latest)
+    quotes = get_quotes(list(cands), latest)          # 最新交易日统一行情（妙想）
+    quote_cover = round(len(quotes) / len(cands) * 100, 1) if cands else 0.0
 
     # 晋级率：上一交易日涨停的票里，本日继续涨停的比例
     promo = {}
@@ -687,12 +689,13 @@ def build_radar():
         if "ST" in name.upper() or name.startswith("退"):
             continue
 
-        zt_days, best = 0, None
+        zt_days, best, best_date = 0, None, None
         for d in dates:
             it = pools[d].get(code)
             if it:
                 zt_days += 1
-                best = best or it
+                if best is None:
+                    best, best_date = it, d
         src = best or {}
 
         lhb = None
@@ -710,15 +713,27 @@ def build_radar():
                 seat["_d"] = d
 
         capinfo = caps.get(code, {})
-        cap = capinfo.get("cap") or src.get("cap_pool") or c.get("cap_mx")
-        float_cap = capinfo.get("float_cap") or src.get("float_cap") or (lhb or {}).get("float_cap")
+        q = quotes.get(code, {})
+        cap = q.get("cap") or capinfo.get("cap") or src.get("cap_pool") or c.get("cap_mx")
+        float_cap = (q.get("float_cap") or capinfo.get("float_cap") or src.get("float_cap")
+                     or (lhb or {}).get("float_cap"))
+        # 行情口径：优先最新交易日（妙想报价 > 估值表），涨停池值只在取不到时兜底并标注日期
+        px = q.get("price") or capinfo.get("close") or src.get("price") or c.get("price") or 0
+        pct = q.get("pct") if q.get("pct") else (capinfo.get("chg") or src.get("pct", c.get("pct", 0)))
+        if not q.get("pct") and not capinfo.get("chg"):
+            pct = src.get("pct", c.get("pct", 0))
+        # 换手率：只认妙想最新交易日值；取不到才退回涨停池当日值，并记下来自哪天
+        if q.get("turnover"):
+            to, to_date = q["turnover"], latest
+        else:
+            to, to_date = src.get("turnover", c.get("turnover", 0)), best_date
 
         p = {
             "code": code, "name": name,
-            "price": capinfo.get("close") or c.get("price") or src.get("price") or 0,
-            "pct": src.get("pct", c.get("pct", 0)) or (capinfo.get("chg") or 0),
-            "turnover": src.get("turnover", c.get("turnover", 0)) or (lhb or {}).get("turnover", 0),
+            "price": px, "pct": pct, "turnover": to,
             "cap": cap, "float_cap": float_cap,
+            "quote_date": latest, "turnover_date": to_date,
+            "limit_up_date": best_date,
             "pe": capinfo.get("pe"), "pb": capinfo.get("pb"),
             "industry": src.get("industry") or c.get("industry_mx") or capinfo.get("board", ""),
             "concepts": (c.get("concepts") or "")[:120],
@@ -778,6 +793,7 @@ def build_radar():
         "mx_ok": mx_ok, "mx_msg": mx_msg, "promo": promo,
         "lhb_pending": lhb_pending,
         "industries": _industry_stat(rows),
+        "quote_cover": quote_cover,
     }
     return rows, tiers, meta
 
@@ -886,6 +902,7 @@ def api_radar():
     keep = ("code", "name", "price", "pct", "turnover", "cap", "float_cap", "pe", "pb",
             "industry", "tier", "lianban", "days", "boards", "zt_days", "seal_fund",
             "first_seal", "open_times", "seal_score", "on_board", "lhb_net", "lhb_buy",
+            "quote_date", "limit_up_date", "turnover_date",
             "lhb_sell", "lhb_deal_ratio", "lhb_reason", "lhb_explain", "lhb_date",
             "org_cnt", "org_dir", "org_net", "north_net", "hot_net", "seat_org_win",
             "concepts",
@@ -896,7 +913,7 @@ def api_radar():
                          "dates": st["meta"].get("dates"), "latest": st["meta"].get("latest"),
                          "source": st["source"], "error": st["error"],
                          "refreshing": st["refreshing"], "total": st["meta"].get("total"),
-                         "passed": st["meta"].get("passed"), "mx_ok": st["meta"].get("mx_ok"),
+                         "passed": st["meta"].get("passed"), "quote_cover": st["meta"].get("quote_cover"), "mx_ok": st["meta"].get("mx_ok"),
                          "mx_msg": st["meta"].get("mx_msg"), "promo": st["meta"].get("promo"),
                          "lhb_pending": st["meta"].get("lhb_pending"),
                          "industries": st["meta"].get("industries"),
@@ -1113,6 +1130,47 @@ def _n(v):
     return str(int(v)) if float(v) == int(float(v)) else str(v)
 
 
+def get_quotes(codes, date):
+    """统一取【最新交易日】行情：妙想按代码清单取 最新价/涨跌幅/换手率/市值。
+    涨停池记录的是各自涨停当天的值，跨日会串口径，所以行情一律以此处为准。"""
+    cl = sorted(set(codes))
+    if not cl:
+        return {}
+    tag = hashlib.md5((",".join(cl) + date).encode()).hexdigest()[:10]
+
+    def build():
+        out = {}
+        for i in range(0, len(cl), 40):
+            part = cl[i:i + 40]
+            q = ("筛选股票代码在(%s)范围内的A股，返回这些股票，"
+                 "包含股票代码、股票简称、最新价、涨跌幅、换手率、总市值、流通市值"
+                 % ",".join('"%s"' % x for x in part))
+            got = 0
+            for attempt in (1, 2):                  # 偶发空响应：整片重试一次
+                try:
+                    rows = mx_post(q)
+                except Exception as e:              # noqa: BLE001
+                    print("QUOTES_PART_FAIL", str(e)[:100])
+                    time.sleep(6)
+                    continue
+                for row in rows:
+                    n = norm_row(row)
+                    if n:
+                        out[n["code"]] = {"price": n["price"], "pct": n["pct"],
+                                          "turnover": n["turnover"], "cap": n["cap"],
+                                          "float_cap": n["float_cap"]}
+                        got += 1
+                if got:
+                    break
+                print("QUOTES_EMPTY 第%d次，重试本片(%d只)" % (attempt, len(part)))
+                time.sleep(8)
+            time.sleep(3)
+        print("QUOTES", date, "->", len(out), "/", len(cl))
+        return out
+
+    return cached("q_" + tag, CACHE_SECONDS, build)
+
+
 def evaluate(r, nh_codes, th):
     """本地逐条判定 6 个条件，阈值来自 th（与问句同源）"""
     ma5, ma10, ma20 = r["ma5"], r["ma10"], r["ma20"]
@@ -1260,8 +1318,10 @@ h1{font-size:19px}
 <button onclick="load(1)">刷新</button></div></div>
 <div id="msg"></div><div id="tiers" class="tiers"></div><div id="out" class="grid"></div>
 <script>
-let RAW=[],TIERS={},onlyFull=false,sortMode='score';
+let RAW=[],TIERS={},onlyFull=false,sortMode='score',tierAll=0;
 const V=v=>(v===null||v===undefined||v==='')?'--':v;
+const N=v=>(v===null||v===undefined||v==='')?'--':Number(v).toFixed(1);
+const D8=x=>x?x.slice(4,6)+'-'+x.slice(6,8):'--';
 const E=v=>(v===null||v===undefined||v===0)?'--':Math.abs(v).toFixed(2)+'亿';
 const S=v=>v>0?('+'+v.toFixed(2)+'亿'):(v<0?('-'+Math.abs(v).toFixed(2)+'亿'):'0');
 function card(r,i){
@@ -1274,16 +1334,16 @@ function card(r,i){
   return `<div class="card${r.hard_full?' full':''}">
    <div class="hd"><div><div class="nm">${r.name}</div><div class="cd">${r.code}</div></div>
      <div class="rank">#<i>${i+1}</i></div></div>
-   <div class="sc"><em>${r.score}</em><span>分</span><span class="pc ${p}">${sign}${(r.pct||0).toFixed(2)}%</span>
+   <div class="sc"><em>${N(r.score)}</em><span>分</span><span class="pc ${p}">${sign}${(r.pct||0).toFixed(2)}%</span>
      <span class="tag">${r.tier}</span></div>
    <div class="ln"><span class="tag ${r.hard_full?'g':''}">${hh}</span>
      ${r.on_board?`<span class="tag n">龙虎榜 ${S(r.lhb_net)}</span>`:'<span class="tag">未上龙虎榜</span>'}
      ${r.org_cnt?`<span class="tag n">${r.org_cnt}家机构${r.org_dir}</span>`:''}</div>
    ${(r.concepts||'').split('、').filter(Boolean).slice(0,4).map(x=>`<span class="tag">${x}</span>`).join(' ')}
    <div class="row"><span>总市值 / 流通</span><b>${V(r.cap)}亿 / ${V(r.float_cap)}亿</b></div>
-   <div class="row"><span>最新价 / 换手</span><b>${V(r.price)} / ${V((r.turnover||0).toFixed(2))}%</b></div>
+   <div class="row"><span>最新价 / 换手</span><b>${V(r.price)} / ${V((r.turnover||0).toFixed(2))}%${r.turnover_date&&r.turnover_date!==r.quote_date?('（'+D8(r.turnover_date)+'口径）'):''}</b></div>
    <div class="row"><span>近3日涨停 / 梯队</span><b>${r.zt_days}次 · ${nb}</b></div>
-   <div class="row"><span>封板强弱</span><b>${r.seal_score}分 · 首封${fs} · 炸板${r.open_times}次</b></div>
+   <div class="row"><span>封板强弱</span><b>${N(r.seal_score)}分 · 首封${fs} · 炸板${r.open_times}次${r.limit_up_date&&r.limit_up_date!==r.quote_date?('（'+D8(r.limit_up_date)+'涨停）'):''}</b></div>
    <div class="row"><span>封单 / 行业</span><b>${E(r.seal_fund)} · ${V(r.industry)}</b></div>
    ${(r.org_net||r.north_net||r.hot_net)?`<div class="sum">席位净额：
      <b>机构 ${S(r.org_net)}</b>　北向 ${S(r.north_net)}　游资 ${S(r.hot_net)}
@@ -1302,6 +1362,8 @@ function render(){
     :'<div class="empty">暂无符合条件的股票<br>休市日或条件过严，可点右上刷新</div>';
 }
 function tiersHtml(t){
+  // 梯队按全部候选统计，列表只展示前 80 张卡片，两者数量口径不同属预期
+  tierAll=Object.values(t).reduce((a,x)=>a+x.n,0);
   const order=['首板','2板','3板','4板及以上'];
   document.getElementById('tiers').innerHTML=order.filter(k=>t[k]).map(k=>{
     const x=t[k],b=x.best?('<i>最高标 '+x.best.name+'('+x.best.mb+'板)</i>'):'';
@@ -1314,14 +1376,16 @@ async function load(refresh){
     const d=await (await fetch('/api/radar?'+Date.now())).json();
     RAW=d.list||[];TIERS=d.tiers||{};
     document.getElementById('src').textContent=
-      `${d.generated||''} · ${d.latest||''} · 候选${d.total||0}只 · 三项全中${d.passed||0}只 · ${d.source}`;
+      `${d.generated||''} · 行情口径 ${D8(d.latest)} 收盘 · 候选${d.total||0}只 · 三项全中${d.passed||0}只 · ${d.source}`;
     let w='';
     if(d.error) w+=`<div class="warn">数据刷新失败：${d.error}<br>当前展示的是上次成功的快照，可能不是最新。</div>`;
     if(d.refreshing && !RAW.length) w+='<div class="note">后台正在拉取数据（约 10–30 秒），请稍候再刷新。</div>';
     if(!d.mx_ok) w+=`<div class="note">未使用妙想选股（${d.mx_msg||''}），已自动降级为东方财富涨停池模式，榜单仍可用。</div>`;
     if(d.lhb_pending) w+='<div class="note">今日龙虎榜约 18:00 后披露，当前龙虎榜维度取最近已披露日。</div>';
+    if((d.quote_cover||0)<95) w+=`<div class="note">最新交易日行情仅覆盖 ${d.quote_cover||0}% 候选，未覆盖的票换手率沿用其涨停当天口径（卡片会标注日期）。</div>`;
     document.getElementById('msg').innerHTML=w;
     tiersHtml(TIERS);render();
+    if(tierAll>RAW.length) document.getElementById('tiers').innerHTML+='<div class="tier" style="border-style:dashed">说明<i>口径说明<i>梯队按全部 '+tierAll+' 只候选统计，列表展示前 '+RAW.length+' 张</i></div>';
   }catch(e){document.getElementById('src').textContent='加载失败：'+e}
 }
 load(0);setInterval(()=>load(0),60000);
