@@ -1,31 +1,3 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-妙想(MXSKILLS)数据客户端 · 生产版
----------------------------------
-只做一件事:把东方财富妙想开放接口封装成「一次调用拿一屏候选」的数据层,
-供柚子六脉这类选股工具做粗筛,细算放本地。
-
-设计要点
-  1. Key 只从环境变量 MX_APIKEY 读,永不写死在代码里,永不进前端。
-  2. 真实取数路径已按实测结构锁定(与官方文档写的路径不同,文档那份是旧的):
-       data.data.allResults.result.{columns, dataList, total}
-     兜底顺序:allResults.result → data.result → partialResults( Markdown 表格 )
-  3. 列是「动态」的 —— 返回哪些字段取决于提问里提到了哪些指标。
-     所以解析器不写死字段,统一走「列定义 → key → 中文标题」映射,来什么认什么。
-  4. 频率限制:内置节流 + 429 退避重试,避免盘中高频把自己打死。
-
-用法
-  export MX_APIKEY=你的key
-  python3 miaoxiang_client.py screen "非ST，总市值30亿到300亿，近15日内有涨停"
-  python3 miaoxiang_client.py screen "..." --csv out.csv
-  python3 miaoxiang_client.py query  "致尚科技 最新价 换手率"
-  python3 miaoxiang_client.py news   "低空经济 板块"
-  python3 miaoxiang_client.py quota            # 看今日调用情况(接口无此口,只统计本进程)
-"""
-
-from __future__ import annotations
-
 import csv
 import json
 import os
