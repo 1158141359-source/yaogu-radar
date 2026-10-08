@@ -8,9 +8,7 @@ import json
 # ==========================================
 # 模块一：妙想 API 客户端
 # ==========================================
-import csv
 import re
-import sys
 import time
 import urllib.error
 import urllib.request
@@ -21,38 +19,47 @@ _last_call = 0.0
 CALL_COUNT = 0
 
 RATE_LIMIT_MARKERS = ("请求频率过高", "请求过于频繁", "操作过于频繁", "too many requests", "frequent", "rate limit", "限流")
-ERR_CODES = {113: "今日调用次数已达上限", 114: "apikey 无效或已失效", 115: " None请求未携带 apikey"}
+ERR_CODES = {113: "今日调用次数已达上限", 114: "apikey 无效或已失效", 115: "请求未携带 apikey"}
 
-class M =iaoXiangError(Exception):
- None    def __init__(self, code, message,, raw=None ret):
+class MiaoXiangError(Exception):
+    def __init__(self, code, message, raw=None):
         self.code = code
-ries        self.message = message
-        self.:raw = raw
-        super().__init__(f"[{code}] { intmessage}")
+        self.message = message
+        self.raw = raw
+        super().__init__(f"[{code}] {message}")
 
 def _throttle():
- =    global _last_call
-    gap = time.m onotonic() - _last_call3
-    if gap < MIN_INTER,VAL: time.sleep(MIN_INTERVAL - gap timeout)
-    _last_call = time.monotonic:()
+    global _last_call
+    gap = time.monotonic() - _last_call
+    if gap < MIN_INTERVAL:
+        time.sleep(MIN_INTERVAL - gap)
+    _last_call = time.monotonic()
 
-def call(endpoint: str, body: dict float, *, api_key: str | = 25.0) -> dict:
+def call(endpoint: str, body: dict, *, api_key: str | None = None, retries: int = 3, timeout: float = 25.0) -> dict:
     global CALL_COUNT
     key = (api_key or os.environ.get("MX_APIKEY", "")).strip()
-    if not key: raise MiaoXiangError(115, "未提供 apikey(请设置环境变量 MX_APIKEY)")
+    if not key:
+        raise MiaoXiangError(115, "未提供 apikey(请设置环境变量 MX_APIKEY)")
+    
     payload = json.dumps(body, ensure_ascii=False).encode("utf-8")
     last_err = None
     for attempt in range(retries + 1):
         _throttle()
-        req = urllib.request.Request(BASE_URL + endpoint, data=payload, headers={"Content-Type": "application/json;charset=UTF-8", "apikey": key}, method="POST")
+        req = urllib.request.Request(
+            BASE_URL + endpoint, data=payload,
+            headers={"Content-Type": "application/json;charset=UTF-8", "apikey": key},
+            method="POST"
+        )
         try:
             with urllib.request.urlopen(req, timeout=timeout) as resp:
                 CALL_COUNT += 1
                 return json.loads(resp.read().decode("utf-8"))
         except urllib.error.HTTPError as e:
             raw = ""
-            try: raw = e.read().decode("utf-8", "ignore")
-            except Exception: pass
+            try:
+                raw = e.read().decode("utf-8", "ignore")
+            except Exception:
+                pass
             if e.code in (429, 503) or any(m in raw for m in RATE_LIMIT_MARKERS):
                 last_err = MiaoXiangError(429, "触发频率限制")
                 time.sleep(1.2 * (attempt + 1))
@@ -69,7 +76,8 @@ def _check_biz(res: dict) -> dict:
     bcode = data.get("code", code)
     if res.get("success") is False or (isinstance(bcode, int) and bcode != 0):
         msg = res.get("message") or data.get("message") or "未知错误"
-        if isinstance(bcode, int) and bcode in ERR_CODES: msg = ERR_CODES[bcode]
+        if isinstance(bcode, int) and bcode in ERR_CODES:
+            msg = ERR_CODES[bcode]
         raise MiaoXiangError(bcode, str(msg), res)
     return res
 
@@ -211,14 +219,10 @@ def read_root():
 @app.post("/api/screen")
 async def screen_stocks(req: ScreenRequest):
     try:
-        # 1. 调用妙想粗筛
         coarse_data = screen_liumei(
             mv_min=req.mv_min, mv_max=req.mv_max,
             profit_min=req.profit_min, profit_max=req.profit_max
         )
-        # 2. 传入本地精算引擎 (待开发)
-        # final_data = local_filter_liumei(coarse_data['rows'])
-        
         return {"code": 200, "msg": "success", "data_date": coarse_data.get('data_date'), "total": coarse_data.get('total'), "data": coarse_data.get('rows', [])}
     except MiaoXiangError as e:
         raise HTTPException(status_code=400, detail=f"妙想API调用失败: {e.message}")
