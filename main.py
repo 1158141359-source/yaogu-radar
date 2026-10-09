@@ -1,5 +1,5 @@
 # main.py
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from fastapi.staticfiles import StaticFiles
@@ -9,18 +9,15 @@ import re
 import time
 import urllib.error
 import urllib.request
-
+import requests
 
 # ==========================================
-# 模块一：妙想 API 客户端
+# 模块一：妙想 API 客户端 (代理)
 # ==========================================
 BASE_URL = "https://mkapi2.dfcfs.com/finskillshub"
 MIN_INTERVAL = 0.35
 _last_call = 0.0
 CALL_COUNT = 0
-
-RATE_LIMIT_MARKERS = ("请求频率过高", "请求过于频繁", "操作过于频繁", "too many requests", "frequent", "rate limit", "限流")
-ERR_CODES = {113: "今日调用次数已达上限", 114: "apikey 无效或已失效", 115: "请求未携带 apikey"}
 
 class MiaoXiangError(Exception):
     def __init__(self, code, message, raw=None):
@@ -36,11 +33,10 @@ def _throttle():
         time.sleep(MIN_INTERVAL - gap)
     _last_call = time.monotonic()
 
-def call(endpoint: str, body: dict, *, api_key: str | None = None, retries: int = 3, timeout: float = 25.0) -> dict:
+def call(endpoint: str, body: dict, *, api_key: str = "", retries: int = 3, timeout: float = 25.0) -> dict:
     global CALL_COUNT
-    key = (api_key or os.environ.get("MX_APIKEY", "")).strip()
-    if not key:
-        raise MiaoXiangError(115, "未提供 apikey(请设置环境变量 MX_APIKEY)")
+    if not api_key:
+        raise MiaoXiangError(115, "未提供 apikey")
     
     payload = json.dumps(body, ensure_ascii=False).encode("utf-8")
     last_err = None
@@ -48,7 +44,7 @@ def call(endpoint: str, body: dict, *, api_key: str | None = None, retries: int 
         _throttle()
         req = urllib.request.Request(
             BASE_URL + endpoint, data=payload,
-            headers={"Content-Type": "application/json;charset=UTF-8", "apikey": key},
+            headers={"Content-Type": "application/json;charset=UTF-8", "apikey": api_key},
             method="POST"
         )
         try:
@@ -57,16 +53,14 @@ def call(endpoint: str, body: dict, *, api_key: str | None = None, retries: int 
                 return json.loads(resp.read().decode("utf-8"))
         except urllib.error.HTTPError as e:
             raw = ""
-            try:
-                raw = e.read().decode("utf-8", "ignore")
-            except Exception:
-                pass
-            if e.code in (429, 503) or any(m in raw for m in RATE_LIMIT_MARKERS):
+            try: raw = e.read().decode("utf-8", "ignore")
+            except: pass
+            if e.code in (429, 503) or any(m in raw for m in ("请求频率过高", "限流", "frequent", "rate limit")):
                 last_err = MiaoXiangError(429, "触发频率限制")
                 time.sleep(1.2 * (attempt + 1))
                 continue
             raise MiaoXiangError(e.code, f"HTTP {e.code}", raw) from e
-        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as e:
+        except Exception as e:
             last_err = e
             time.sleep(0.8 * (attempt + 1))
     raise MiaoXiangError(-1, f"重试 {retries} 次仍失败: {last_err}")
@@ -77,19 +71,16 @@ def _check_biz(res: dict) -> dict:
     bcode = data.get("code", code)
     if res.get("success") is False or (isinstance(bcode, int) and bcode != 0):
         msg = res.get("message") or data.get("message") or "未知错误"
-        if isinstance(bcode, int) and bcode in ERR_CODES:
-            msg = ERR_CODES[bcode]
         raise MiaoXiangError(bcode, str(msg), res)
     return res
 
 CANON = {
-    "SECURITY_CODE": "code", "SECURITY_SHORT_NAME": "name", "MARKET_SHORT_NAME": "market",
-    "NEWEST_PRICE": "price", "CHG": "chg", "PCHG": "pchg", "010000_HLP": "profit_ratio",
+    "SECURITY_CODE": "code", "SECURITY_SHORT_NAME": "name", "NEWEST_PRICE": "price",
+    "CHG": "chg", "PCHG": "pchg", "010000_HLP": "profit_ratio",
     "010000_CMFB_461_JZD90": "chip_conc_90", "010000_TURNOVER_RATE": "turnover_rate",
     "010000_LIANGBI": "volume_ratio", "010000_VOLUME": "volume", "010000_TRADING_VOLUMES": "amount",
-    "010000_TOAL_MARKET_VALUE": "total_mv", "010000_CIRCULATION_MARKET_VALUE": "float_mv",
-    "010000_PE_D": "pe", "010000_PB": "pb", "010000_PEAK_PRICE": "high", "010000_BOTTOM_PRICE": "low",
-    "010000_DURATION_LIMIT_UP": "limit_up_count", "010000_JX": "ma", "010000_CUSTOM_IFSTSTOCK_IFSTSTOCK_": "is_st",
+    "010000_TOAL_MARKET_VALUE": "total_mv", "010000_PEAK_PRICE": "high", "010000_BOTTOM_PRICE": "low",
+    "010000_DURATION_LIMIT_UP": "limit_up_count",
 }
 _KEY_RE = re.compile(r"^(?P<base>[A-Za-z0-9_]+?)(?:<\d+>)?(?:\{(?P<meta>[^}]*)\})?$")
 _UNIT_RE = re.compile(r"([-+]?\d+(?:\.\d+)?)\s*(亿|万|%)?")
@@ -114,27 +105,11 @@ def _dig(node, *path):
         node = node.get(p)
     return node
 
-def _parse_md_table(md: str):
-    if not md or "|" not in md: return [], []
-    lines = [ln.strip() for ln in md.strip().splitlines() if ln.strip().startswith("|")]
-    if len(lines) < 2: return [], []
-    def cells(ln): return [c.strip() for c in ln.strip("|").split("|")]
-    headers = cells(lines[0]); rows = []
-    for ln in lines[1:]:
-        cs = cells(ln)
-        if cs and set("".join(cs)) <= set("-: "): continue
-        rows.append(dict(zip(headers, cs)))
-    return headers, rows
-
 def _pick_result(d: dict):
     cands = [(_dig(d, "allResults", "result"), "allResults.result"), (_dig(d, "result"), "result"), (_dig(d, "allResults"), "allResults")]
     for node, src in cands:
         if isinstance(node, dict) and (node.get("dataList") or node.get("columns")):
             return node.get("columns") or [], node.get("dataList") or [], node.get("total"), src
-    md = d.get("partialResults")
-    if isinstance(md, str) and "|" in md:
-        cols, rows = _parse_md_table(md)
-        if rows: return [{"title": h, "key": h} for h in cols], rows, len(rows), "partialResults(md)"
     return [], [], 0, "none"
 
 def normalize(d: dict) -> dict:
@@ -151,167 +126,179 @@ def normalize(d: dict) -> dict:
         for k, v in row.items():
             base, meta = split_key(k)
             field = CANON.get(base)
-            if field:
-                if field == "ma": extra[f"{title_of.get(base, base)}@{meta}"] = v
-                else: canon[field] = v
+            if field: canon[field] = v
             else:
                 title = title_of.get(base, base)
-                if base in ("CHOICE_INNER_CODE", "IN_OPTIONAL", "SERIAL", "MARKET_SHORT_NAME"): continue
+                if base in ("CHOICE_INNER_CODE", "IN_OPTIONAL", "SERIAL"): continue
                 extra[f"{title}@{meta}" if meta else title] = v
-        for f in ("price", "chg", "pchg", "profit_ratio", "chip_conc_90", "turnover_rate", "volume_ratio", "pe", "pb", "high", "low"):
+        for f in ("price", "chg", "pchg", "profit_ratio", "chip_conc_90", "turnover_rate", "volume_ratio"):
             if f in canon: canon[f] = to_num(canon[f])
-        for f in ("total_mv", "float_mv", "volume", "amount"):
-            if f in canon: canon[f + "_raw"] = canon[f]; canon[f] = to_num(canon[f])
         if "limit_up_count" in canon: canon["limit_up_count"] = to_num(canon["limit_up_count"])
         canon["extra"] = extra
         out_rows.append(canon)
-    tc = d.get("totalCondition")
-    tc_desc = tc.get("describe") if isinstance(tc, dict) else tc if isinstance(tc, str) else None
-    if not tc_desc: tc_desc = _dig(d, "allResults", "totalCondition", "describe")
-    return {"total": total if total is not None else len(out_rows), "condition": tc_desc, "data_date": None, "source": source, "rows": out_rows}
+    return {"total": total if total is not None else len(out_rows), "rows": out_rows}
 
-def stock_screen(keyword: str, page_no: int = 1, page_size: int = 50, api_key: str | None = None) -> dict:
-    body = {"keyword": keyword}
-    if page_no != 1: body["pageNo"] = page_no
-    if page_size: body["pageSize"] = page_size
+def stock_screen(keyword: str, api_key: str = "") -> dict:
+    body = {"keyword": keyword, "pageNo": 1, "pageSize": 50}
     res = _check_biz(call("/api/claw/stock-screen", body, api_key=api_key))
     d = _dig(res, "data", "data") or {}
-    out = normalize(d)
-    out["query"] = keyword
-    for c in (d.get("allResults", {}) or {}).get("result", {}).get("columns", []) or []:
-        _, meta = split_key(c.get("key") or "")
-        if len(meta) == 10 and meta[4] == "-": out["data_date"] = meta; break
-    return out
-
-def liumei_coarse_keyword(*, mv_min: int = 30, mv_max: int = 300, limit_up_days: int = 15, exclude_st: bool = True, profit_min: float | None = None, profit_max: float | None = None, min_turnover: float | None = None, min_volume_ratio: float | None = None, ma_up: bool = True, chip: bool = True) -> str:
-    parts = []
-    if exclude_st: parts.append("非ST")
-    parts.append(f"总市值{mv_min}亿到{mv_max}亿")
-    parts.append(f"近{limit_up_days}日内有涨停")
-    if ma_up: parts.append("5日均线向上")
-    if profit_min is not None or profit_max is not None:
-        lo = f"{profit_min}%" if profit_min is not None else "0%"
-        hi = f"{profit_max}%" if profit_max is not None else "100%"
-        parts.append(f"获利盘在{lo}到{hi}之间")
-    if chip: parts.append("筹码集中度")
-    if min_turnover is not None: parts.append(f"今日换手率大于{min_turnover}%")
-    if min_volume_ratio is not None: parts.append(f"今日量比大于{min_volume_ratio}")
-    return "，".join(parts)
-
-def screen_liumei(**kw) -> dict:
-    return stock_screen(liumei_coarse_keyword(**kw))
+    return normalize(d)
 
 
 # ==========================================
-# 模块一.5：本地精算引擎 (无K线纯API打分版)
+# 模块二：东财K线代理 + 本地三层逻辑
 # ==========================================
-def local_filter_liumei(candidates: list[dict]) -> list[dict]:
-    """接收妙想粗筛出的候选池，直接基于API截面数据打分"""
-    final_results = []
+def fetch_eastmoney_kline(code: str, days: int = 30) -> list:
+    """后端代理请求东方财富K线（解决前端CORS限制）"""
+    prefix = "1" if code.startswith("6") else "0"
+    secid = f"{prefix}.{code}"
+    url = f"https://push2his.eastmoney.com/api/qt/stock/kline/get"
+    params = {
+        "secid": secid, "fields1": "f1,f2,f3,f4,f5",
+        "fields2": "f51,f52,f53,f54,f55,f56,f57",
+        "klt": "101", "fqt": "1", "beg": "0", "end": "20500000", "lmt": days
+    }
+    try:
+        res = requests.get(url, params=params, timeout=10)
+        data = res.json()
+        klines = data.get('data', {}).get('klines', [])
+        result = []
+        for line in klines:
+            parts = line.split(",")
+            result.append({
+                "date": parts[0], "open": float(parts[1]), "close": float(parts[2]),
+                "high": float(parts[3]), "low": float(parts[4]), "volume": float(parts[5])
+            })
+        return result
+    except Exception as e:
+        print(f"东财K线获取失败 {code}: {e}")
+        return []
+
+def analyze_stock(stock: dict) -> dict:
+    code = stock.get('code')
+    name = stock.get('name')
+    price = stock.get('price', 0)
+    chg = stock.get('chg', 0)
+    limit_up = stock.get('limit_up_count', 0)
+    profit_ratio = stock.get('profit_ratio', 0)
+
+    klines = fetch_eastmoney_kline(code, 30)
+    if not klines or len(klines) < 10:
+        return {"code": code, "name": name, "score": 0, "rating": "数据不足", "error": "K线缺失", "timing_tags": [], "holding_tags": [], "hard_conditions": []}
+
+    closes = [k['close'] for k in klines]
+    volumes = [k['volume'] for k in klines]
+    highs = [k['high'] for k in klines]
+    lows = [k['low'] for k in klines]
     
-    for stock in candidates:
-        # 基础分数
-        score = 0
-        
-        # 1. 盘口强度（今日涨跌幅，20分）
-        chg = stock.get('chg', 0)
-        if chg > 0 and chg < 7:
-            score += 20
-        elif chg >= 7:
-            score += 10 # 涨幅过大容易透支
-            
-        # 2. 抛压控制（今日量比，20分）
-        # 量比适中（1.0 - 2.5），说明交投活跃但不是天量出货
-        vol_ratio = stock.get('volume_ratio', 0)
-        if 1.0 <= vol_ratio <= 2.5:
-            score += 20
-        elif vol_ratio > 2.5:
-            score += 10 # 量能过大，警惕
-            
-        # 3. 筹码锁定（获利盘，20分）
-        profit_ratio = stock.get('profit_ratio', 0)
-        if 60 <= profit_ratio <= 85:
-            score += 20
-        elif profit_ratio > 85:
-            score += 10 # 获利盘太高，有兑现风险
-            
-        # 4. 涨停基因（20分）
-        limit_up = stock.get('limit_up_count', 0)
-        if limit_up >= 1:
-            score += 20
-            
-        # 5. 守线（价格在5日均线之上，20分）
-        extra = stock.get('extra', {})
-        ma5_str = extra.get('5日均线(元)')
-        price = stock.get('price', 0)
-        if ma5_str:
-            try:
-                ma5 = float(ma5_str)
-                if price > ma5:
-                    score += 20
-                else:
-                    score += 5 # 跌破5日线，减分
-            except:
-                score += 10
-        else:
-            score += 10 # 没有均线数据，给基础分
-            
-        # 封装最终结果
-        stock['score'] = round(score, 1)
-        
-        # 评级标准
-        if score >= 90:
-            stock['rating'] = 'S'
-        elif score >= 70:
-            stock['rating'] = 'A'
-        elif score >= 50:
-            stock['rating'] = 'B'
-        else:
-            stock['rating'] = 'C'
-            
-        final_results.append(stock)
-        
-    # 按分数从高到低排序
-    final_results.sort(key=lambda x: x['score'], reverse=True)
-    return final_results
+    ma5 = sum(closes[-5:]) / 5 if len(closes) >= 5 else closes[-1]
+    v_ma5 = sum(volumes[-5:]) / 5 if len(volumes) >= 5 else volumes[-1]
+    v_ma5_prev = sum(volumes[-10:-5]) / 5 if len(volumes) >= 10 else volumes[-1]
+    today = klines[-1]
+    yesterday = klines[-2] if len(klines) >= 2 else today
+    
+    # --- 第一层：硬条件判断 ---
+    score = 0
+    hard_conditions = []
+
+    c1 = all(closes[-i] > ma5 for i in range(1, 6)) and price > ma5
+    hard_conditions.append({"name": "连续5日上涨", "pass": c1, "desc": f"5日线 {ma5:.2f}"})
+    if c1: score += 20
+
+    c2 = (limit_up > 0)
+    hard_conditions.append({"name": "30日内有过涨停", "pass": c2, "desc": f"涨停 {limit_up} 次"})
+    if c2: score += 20
+
+    c3 = (price >= ma5)
+    hard_conditions.append({"name": "收盘不破5日线", "pass": c3, "desc": f"现价 {price} vs MA5 {ma5:.2f}"})
+    if c3: score += 20
+
+    vol_ratio_5d = v_ma5_prev > 0 and (v_ma5 / v_ma5_prev) or 0
+    c4 = (1.3 <= vol_ratio_5d <= 1.8)
+    hard_conditions.append({"name": "堆量成交量", "pass": c4, "desc": f"5日均量比 {vol_ratio_5d:.2f}"})
+    if c4: score += 20
+
+    # 如果有Key，C5用原生获利盘；没Key则没有数据（前端已做降级处理）
+    c5 = (60 <= profit_ratio <= 85)
+    hard_conditions.append({"name": "底部筹码不动", "pass": c5, "desc": f"获利盘 {profit_ratio}%"})
+    if c5: score += 20
+
+    # --- 第二层：买卖时机 ---
+    timing_tags = []
+    if chg < -3 and price > today['low'] and price > yesterday['low']:
+        timing_tags.append({"type": "buy", "text": "🟢 援军战法：重挫企稳"})
+    if chg < 0 and (today['high'] - price) > (price - today['low']) * 1.5:
+        timing_tags.append({"type": "buy", "text": "🟢 反转阴线"})
+    if (today['high'] - price) > price * 0.03 and price > ma5:
+        timing_tags.append({"type": "watch", "text": "🟡 仙人指路"})
+    if chg < -3 and price < ma5:
+        timing_tags.append({"type": "risk", "text": "🔴 破位阴线"})
+    if not timing_tags:
+        timing_tags.append({"type": "watch", "text": "🟡 暂无明确时机信号"})
+
+    # --- 第三层：持股/卖出 ---
+    holding_tags = []
+    if today['high'] > yesterday['high'] and today['low'] > yesterday['low'] and today['close'] > yesterday['close']:
+        holding_tags.append({"type": "hold", "text": "🟢 持股：高点高 + 低点高 + 收盘高"})
+    elif today['high'] <= yesterday['high']:
+        holding_tags.append({"type": "sell", "text": "🔴 卖出提示：高点不创新高"})
+    else:
+        holding_tags.append({"type": "hold", "text": "🟡 震荡：等待方向"})
+
+    stock['score'] = score
+    stock['rating'] = 'S' if score == 100 else ('A' if score >= 80 else ('B' if score >= 60 else 'C'))
+    stock['hard_conditions'] = hard_conditions
+    stock['timing_tags'] = timing_tags
+    stock['holding_tags'] = holding_tags
+    return stock
+
+def local_filter_liumei(candidates: list[dict]) -> dict:
+    final_data = []
+    for stock in candidates[:30]:
+        analyzed = analyze_stock(stock)
+        final_data.append(analyzed)
+    
+    final_data.sort(key=lambda x: x['score'], reverse=True)
+    strict_hits = [s for s in final_data if s['score'] == 100]
+    near_hits = [s for s in final_data if s['score'] == 80]
+    
+    return {"strict_hits": strict_hits[:3], "near_hits": near_hits[:5], "all_data": final_data}
 
 
 # ==========================================
-# 模块二：FastAPI Web 服务
+# 模块三：FastAPI Web 服务 (无状态代理)
 # ==========================================
-app = FastAPI(title="Yaogu-Radar API", description="柚子六脉选股工具后端")
+app = FastAPI(title="Yaogu-Radar API")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 class ScreenRequest(BaseModel):
     mv_min: int = 30
     mv_max: int = 300
-    profit_min: float = 60
-    profit_max: float = 85
+    api_key: str = ""  # 接收前端传来的Key，但不存储
 
 @app.post("/api/screen")
 async def screen_stocks(req: ScreenRequest):
     try:
-        # 1. 调用妙想粗筛
-        coarse_data = screen_liumei(
-            mv_min=req.mv_min, mv_max=req.mv_max,
-            profit_min=req.profit_min, profit_max=req.profit_max
-        )
+        # 1. 使用前端传来的Key进行妙想粗筛
+        kw = f"非ST，总市值{req.mv_min}亿到{req.mv_max}亿，近30日内有涨停"
+        coarse_data = stock_screen(kw, api_key=req.api_key)
         
-        # 2. 传入无K线本地打分引擎
-        final_data = local_filter_liumei(coarse_data.get('rows', []))
+        # 2. 后端去抓东财K线并精算
+        result = local_filter_liumei(coarse_data.get('rows', []))
         
-        # 3. 返回打分排序后的结果
         return {
-            "code": 200, 
-            "msg": "success", 
-            "data_date": coarse_data.get('data_date'), 
-            "total": len(final_data), 
-            "data": final_data
+            "code": 200, "msg": "success", 
+            "total_strict": len(result['strict_hits']),
+            "total_near": len(result['near_hits']),
+            "strict_hits": result['strict_hits'],
+            "near_hits": result['near_hits']
         }
     except MiaoXiangError as e:
         raise HTTPException(status_code=400, detail=f"妙想API调用失败: {e.message}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"内部计算错误: {str(e)}")
 
-# ⬇️ 新增：挂载当前目录下的静态文件（让根路径 / 直接显示 index.html）
+# 挂载静态文件（前端页面）
 app.mount("/", StaticFiles(directory=".", html=True), name="static")
 
 if __name__ == "__main__":
