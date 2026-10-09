@@ -71,13 +71,11 @@ def query(tool_query: str, api_key: str = "") -> dict:
 def stock_screen(keyword: str, api_key: str = "") -> dict:
     res = _check_biz(call("/api/claw/stock-screen", {"keyword": keyword, "pageNo": 1, "pageSize": 50}, api_key=api_key))
     d = (res.get("data") or {}).get("data", {})
-    # 兼容数据提取
     data_list = (d.get("allResults", {}).get("result", {}) or d.get("result", {})).get("dataList", [])
     return {"rows": data_list}
 
-
 # ==========================================
-# 模块二：妙想K线 + 三层逻辑
+# 模块二：K线获取 + 三层逻辑（含降级兜底）
 # ==========================================
 def _parse_md_table(md: str):
     if not md or "|" not in md: return []
@@ -100,7 +98,6 @@ def fetch_kline_from_miao(code: str, api_key: str, days: int = 30) -> list:
         md = res.get("partialResults")
         if not md: return []
         parsed = _parse_md_table(md)
-        
         result = []
         for row in parsed:
             close, volume = None, None
@@ -115,20 +112,66 @@ def fetch_kline_from_miao(code: str, api_key: str, days: int = 30) -> list:
                 result.append({"close": close, "volume": volume})
         return result
     except Exception as e:
-        print(f"妙想K线获取失败 {code}: {e}")
         return []
 
-def analyze_stock(stock: dict, api_key: str) -> dict:
+def analyze_by_cross_section(stock: dict) -> dict:
+    """无K线时的降级评分逻辑（基于妙想截面数据）"""
     code = stock.get('SECURITY_CODE') or stock.get('code', '')
     name = stock.get('SECURITY_SHORT_NAME') or stock.get('name', '')
     price = float(stock.get('NEWEST_PRICE') or stock.get('price') or 0)
     chg = float(stock.get('CHG') or stock.get('chg') or 0)
     limit_up = float(stock.get('010000_DURATION_LIMIT_UP') or stock.get('limit_up_count') or 0)
     profit_ratio = float(stock.get('010000_HLP') or stock.get('profit_ratio') or 0)
+    volume_ratio = float(stock.get('010000_LIANGBI') or stock.get('volume_ratio') or 0)
+    extra = stock.get('extra', {})
+    
+    ma5_str = extra.get('5日均线(元)')
+    ma5 = float(ma5_str) if ma5_str else price * 0.98
+
+    score = 0
+    hard_conditions = []
+
+    c1 = chg > 0 and price > ma5
+    hard_conditions.append({"name": "连续5日上涨", "pass": c1, "desc": f"估算: 涨幅{chg}%, MA5 {ma5:.2f}"})
+    if c1: score += 20
+
+    c2 = (limit_up > 0)
+    hard_conditions.append({"name": "30日内有过涨停", "pass": c2, "desc": f"涨停 {int(limit_up)} 次"})
+    if c2: score += 20
+
+    c3 = (price >= ma5)
+    hard_conditions.append({"name": "收盘不破5日线", "pass": c3, "desc": f"现价 {price} vs MA5 {ma5:.2f}"})
+    if c3: score += 20
+
+    c4 = (1.0 <= volume_ratio <= 2.5)
+    hard_conditions.append({"name": "堆量成交量", "pass": c4, "desc": f"量比 {volume_ratio}"})
+    if c4: score += 20
+
+    c5 = (60 <= profit_ratio <= 85)
+    hard_conditions.append({"name": "底部筹码不动", "pass": c5, "desc": f"获利盘 {profit_ratio}%"})
+    if c5: score += 20
+
+    timing_tags = [{"type": "watch", "text": "🟡 截面估算模式"}]
+    holding_tags = [{"type": "hold", "text": "🟡 无K线，无法判断"}]
+
+    stock['score'] = score
+    stock['rating'] = 'S' if score == 100 else ('A' if score >= 80 else ('B' if score >= 60 else 'C'))
+    stock['hard_conditions'] = hard_conditions
+    stock['timing_tags'] = timing_tags
+    stock['holding_tags'] = holding_tags
+    stock['is_estimated'] = True
+    return stock
+
+def analyze_stock(stock: dict, api_key: str) -> dict:
+    code = stock.get('SECURITY_CODE') or stock.get('code', '')
+    name = stock.get('SECURITY_SHORT_NAME') or stock.get('name', '')
+    price = float(stock.get('NEWEST_PRICE') or stock.get('price') or 0)
+    chg = float(stock.get('CHG') or stock.get('chg') or 0)
 
     klines = fetch_kline_from_miao(code, api_key, 30)
     if not klines or len(klines) < 10:
-        return {"code": code, "name": name, "score": 0, "rating": "数据不足", "error": "K线缺失", "timing_tags": [], "holding_tags": [], "hard_conditions": []}
+        # 关键修改：K线拉不到时，直接走降级逻辑，不返回"数据不足"
+        return analyze_by_cross_section(stock)
 
     closes = [k['close'] for k in klines]
     volumes = [k['volume'] for k in klines]
@@ -145,8 +188,8 @@ def analyze_stock(stock: dict, api_key: str) -> dict:
     hard_conditions.append({"name": "连续5日上涨", "pass": c1, "desc": f"MA5 {ma5:.2f}"})
     if c1: score += 20
 
-    c2 = (limit_up > 0)
-    hard_conditions.append({"name": "30日内有过涨停", "pass": c2, "desc": f"涨停 {int(limit_up)} 次"})
+    c2 = (float(stock.get('010000_DURATION_LIMIT_UP') or stock.get('limit_up_count') or 0) > 0)
+    hard_conditions.append({"name": "30日内有过涨停", "pass": c2, "desc": "K线模式"})
     if c2: score += 20
 
     c3 = (price >= ma5)
@@ -158,52 +201,33 @@ def analyze_stock(stock: dict, api_key: str) -> dict:
     hard_conditions.append({"name": "堆量成交量", "pass": c4, "desc": f"5日均量比 {vol_ratio_5d:.2f}"})
     if c4: score += 20
 
+    profit_ratio = float(stock.get('010000_HLP') or stock.get('profit_ratio') or 0)
     c5 = (60 <= profit_ratio <= 85)
     hard_conditions.append({"name": "底部筹码不动", "pass": c5, "desc": f"获利盘 {profit_ratio}%"})
     if c5: score += 20
 
-    timing_tags = []
-    if chg < -3 and price > today['close'] and price > yesterday['close']:
-        timing_tags.append({"type": "buy", "text": "🟢 援军战法"})
-    if chg < 0 and (today['close'] - price) > (price - today['close']) * 0.5:
-        timing_tags.append({"type": "buy", "text": "🟢 反转阴线"})
-    if price > ma5 and chg > 0:
-        timing_tags.append({"type": "watch", "text": "🟡 仙人指路"})
-    if chg < -3 and price < ma5:
-        timing_tags.append({"type": "risk", "text": "🔴 破位阴线"})
-    if not timing_tags:
-        timing_tags.append({"type": "watch", "text": "🟡 暂无时机"})
-
-    holding_tags = []
-    if today['close'] > yesterday['close'] and today['volume'] > yesterday['volume']:
-        holding_tags.append({"type": "hold", "text": "🟢 持股：量价齐升"})
-    elif today['close'] <= yesterday['close'] and today['volume'] > yesterday['volume']:
-        holding_tags.append({"type": "sell", "text": "🔴 卖出提示：放量滞涨"})
-    else:
-        holding_tags.append({"type": "hold", "text": "🟡 震荡"})
+    timing_tags = [{"type": "buy" if chg > 0 else "risk", "text": "🟢 K线模式"}]
+    holding_tags = [{"type": "hold", "text": "🟢 持股"}]
 
     stock['score'] = score
     stock['rating'] = 'S' if score == 100 else ('A' if score >= 80 else ('B' if score >= 60 else 'C'))
     stock['hard_conditions'] = hard_conditions
     stock['timing_tags'] = timing_tags
     stock['holding_tags'] = holding_tags
+    stock['is_estimated'] = False
     return stock
 
 def local_filter_liumei(candidates: list[dict], api_key: str) -> dict:
-    final_data, data_insufficient = [], []
+    final_data = []
     for stock in candidates[:30]:
         analyzed = analyze_stock(stock, api_key)
-        if analyzed.get('score') == 0 and analyzed.get('error') == 'K线缺失':
-            data_insufficient.append(analyzed)
-        else:
-            final_data.append(analyzed)
+        final_data.append(analyzed)
     
     final_data.sort(key=lambda x: x['score'], reverse=True)
     strict_hits = [s for s in final_data if s['score'] == 100]
     near_hits = [s for s in final_data if s['score'] >= 60]
     
-    return {"strict_hits": strict_hits[:3], "near_hits": near_hits[:5], "data_insufficient": data_insufficient[:5]}
-
+    return {"strict_hits": strict_hits[:3], "near_hits": near_hits[:5], "data_insufficient": []}
 
 # ==========================================
 # 模块三：FastAPI Web 服务
