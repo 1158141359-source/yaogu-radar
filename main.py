@@ -4,7 +4,31 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import os
 import json
+import datetime
+import akshare as ak
 
+def get_kline(code: str):
+    """获取某只股票过去30天的日K数据（前复权）"""
+    # 1. 清洗股票代码（去掉 sh、sz 前缀，akshare 只需要纯数字）
+    pure_code = code.replace("sh", "").replace("sz", "").replace("SH", "").replace("SZ", "")
+    
+    # 2. 动态计算日期（获取过去30天的数据，给计算均线和量能留足空间）
+    end_date = datetime.date.today().strftime("%Y%m%d")
+    start_date = (datetime.date.today() - datetime.timedelta(days=30)).strftime("%Y%m%d")
+    
+    try:
+        # 3. 拉取前复权数据（qfq）
+        df = ak.stock_zh_a_hist(
+            symbol=pure_code, 
+            period="daily", 
+            start_date=start_date, 
+            end_date=end_date, 
+            adjust="qfq"
+        )
+        return df
+    except Exception as e:
+        print(f"获取 {code} 的K线数据失败: {e}")
+        return None
 # ==========================================
 # 模块一：妙想 API 客户端
 # ==========================================
