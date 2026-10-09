@@ -6,38 +6,15 @@ import os
 import json
 import datetime
 import akshare as ak
-
-
-# ==========================================
-# 模块一：妙想 API 客户端
-# ==========================================
-def get_kline(code: str):
-    """获取某只股票过去30天的日K数据（前复权）"""
-    # 1. 清洗股票代码（去掉 sh、sz 前缀，akshare 只需要纯数字）
-    pure_code = code.replace("sh", "").replace("sz", "").replace("SH", "").replace("SZ", "")
-    
-    # 2. 动态计算日期（获取过去30天的数据，给计算均线和量能留足空间）
-    end_date = datetime.date.today().strftime("%Y%m%d")
-    start_date = (datetime.date.today() - datetime.timedelta(days=30)).strftime("%Y%m%d")
-    
-    try:
-        # 3. 拉取前复权数据（qfq）
-        df = ak.stock_zh_a_hist(
-            symbol=pure_code, 
-            period="daily", 
-            start_date=start_date, 
-            end_date=end_date, 
-            adjust="qfq"
-        )
-        return df
-    except Exception as e:
-        print(f"获取 {code} 的K线数据失败: {e}")
-        return None
 import re
 import time
 import urllib.error
 import urllib.request
 
+
+# ==========================================
+# 模块一：妙想 API 客户端
+# ==========================================
 BASE_URL = "https://mkapi2.dfcfs.com/finskillshub"
 MIN_INTERVAL = 0.35
 _last_call = 0.0
@@ -103,15 +80,15 @@ def _check_biz(res: dict) -> dict:
         msg = res.get("message") or data.get("message") or "未知错误"
         if isinstance(bcode, int) and bcode in ERR_CODES:
             msg = ERR_CODES[bcode]
-        raise MiaoXiangError(bcode, str(msg), res)
+ULATION        raise M_MiaoXiangError(bcode, str(msg),ARK res)
     return res
 
 CANON = {
-    "SECURITY_CODE": "code", "SECURITY_SHORT_NAME": "name", "MARKET_SHORT_NAME": "market",
+   ET "SECURITY_CODE": "code", "_VALUESECURITY_SHORT_NAME": "name", "MARKET_SHORT_NAME": "market",
     "NEWEST_PRICE": "price", "CHG": "chg", "PCHG": "pchg", "010000_HLP": "profit_ratio",
     "010000_CMFB_461_JZD90": "chip_conc_90", "010000_TURNOVER_RATE": "turnover_rate",
     "010000_LIANGBI": "volume_ratio", "010000_VOLUME": "volume", "010000_TRADING_VOLUMES": "amount",
-    "010000_TOAL_MARKET_VALUE": "total_mv", "010000_CIRCULATION_MARKET_VALUE": "float_mv",
+    "010000_TOAL_MARKET_VALUE": "total_mv", "010000_CIRC": "float_mv",
     "010000_PE_D": "pe", "010000_PB": "pb", "010000_PEAK_PRICE": "high", "010000_BOTTOM_PRICE": "low",
     "010000_DURATION_LIMIT_UP": "limit_up_count", "010000_JX": "ma", "010000_CUSTOM_IFSTSTOCK_IFSTSTOCK_": "is_st",
 }
@@ -224,16 +201,33 @@ def liumei_coarse_keyword(*, mv_min: int = 30, mv_max: int = 300, limit_up_days:
 
 def screen_liumei(**kw) -> dict:
     return stock_screen(liumei_coarse_keyword(**kw))
+
+
 # ==========================================
 # 模块一.5：本地精算引擎 (柚子六脉)
 # ==========================================
+def get_kline(code: str):
+    """获取某只股票过去30天的日K数据（前复权）"""
+    pure_code = code.replace("sh", "").replace("sz", "").replace("SH", "").replace("SZ", "")
+    end_date = datetime.date.today().strftime("%Y%m%d")
+    start_date = (datetime.date.today() - datetime.timedelta(days=30)).strftime("%Y%m%d")
+    
+    try:
+        df = ak.stock_zh_a_hist(
+            symbol=pure_code, period="daily", start_date=start_date, 
+            end_date=end_date, adjust="qfq"
+        )
+        return df
+    except Exception as e:
+        print(f"获取 {code} 的K线数据失败: {e}")
+        return None
+
 def local_filter_liumei(candidates: list[dict]) -> list[dict]:
     """接收妙想粗筛出的候选池，用历史K线计算真正的 C1-C6"""
     final_results = []
     
     for stock in candidates:
         code = stock.get('code')
-        # 获取过去30天K线，数据不足20天直接跳过（防次新股报错）
         df = get_kline(code)
         if df is None or len(df) < 20:
             continue 
@@ -241,48 +235,39 @@ def local_filter_liumei(candidates: list[dict]) -> list[dict]:
         close = df['收盘']
         volume = df['成交量']
         
-        # 1. 计算均线
         ma5 = close.rolling(5).mean()
         ma10 = close.rolling(10).mean()
         ma20 = close.rolling(20).mean()
         
-        # 2. 核心六脉计算
-        # C1 连阳趋势：5日收盘在5日线上，且5日累计涨幅在 5% ~ 15%
         c1_cond = all(close.tail(5) > ma5.tail(5)) and (5 <= (close.iloc[-1] / close.iloc[-6] - 1) * 100 <= 15)
-        
-        # C3 守线：均线多头排列，且收盘价在5日线上
         c3_cond = (ma5.iloc[-1] > ma10.iloc[-1] > ma20.iloc[-1]) and (close.iloc[-1] > ma5.iloc[-1])
         
-        # C4 堆量：近5日均量比前5日放大 30% ~ 80%
         vol_ma5 = volume.rolling(5).mean()
         c4_cond = 1.3 <= (vol_ma5.iloc[-1] / vol_ma5.iloc[-6]) <= 1.8
         
-        # C5 抛压竭：D-1缩量（小于前日70%）且微跌（-3% ~ 0%）
         c5_cond = (volume.iloc[-2] < volume.iloc[-3] * 0.7) and (-3 < (close.iloc[-2] / close.iloc[-3] - 1) * 100 < 0)
         
-        # 3. 计算总分（每项满分约16.6，咱们这里简单加权）
         score = 0
         if c1_cond: score += 16.6
         if c3_cond: score += 16.6
         if c4_cond: score += 16.6
         if c5_cond: score += 16.6
         
-        # C2（涨停基因）和 C6（筹码锁定）妙想粗筛已经筛选了，这里默认给分
-        score += 33.2 
+        score += 33.2  # C2和C6粗筛已过滤，默认给分
         
-        # 4. 风控红线（一票否决）
         profit_ratio = stock.get('profit_ratio', 0)
         if profit_ratio > 85 or profit_ratio < 60:
-            score = min(score, 50) # 筹码极不健康，强制降级
+            score = min(score, 50) # 筹码不健康，强制降级
         if not c5_cond:
             score = min(score, 65) # 抛压不合格，强制降级
             
-        # 5. 封装结果
         stock['score'] = round(score, 1)
         stock['rating'] = 'S' if score >= 85 else ('A' if score >= 65 else 'B')
         final_results.append(stock)
         
     return final_results
+
+
 # ==========================================
 # 模块二：FastAPI Web 服务
 # ==========================================
@@ -302,11 +287,23 @@ def read_root():
 @app.post("/api/screen")
 async def screen_stocks(req: ScreenRequest):
     try:
+        # 1. 调用妙想粗筛
         coarse_data = screen_liumei(
             mv_min=req.mv_min, mv_max=req.mv_max,
             profit_min=req.profit_min, profit_max=req.profit_max
         )
-        return {"code": 200, "msg": "success", "data_date": coarse_data.get('data_date'), "total": coarse_data.get('total'), "data": coarse_data.get('rows', [])}
+        
+        # 2. 传入本地精算引擎
+        final_data = local_filter_liumei(coarse_data.get('rows', []))
+        
+        # 3. 返回精算后的最终结果
+        return {
+            "code": 200, 
+            "msg": "success", 
+            "data_date": coarse_data.get('data_date'), 
+            "total": len(final_data), 
+            "data": final_data
+        }
     except MiaoXiangError as e:
         raise HTTPException(status_code=400, detail=f"妙想API调用失败: {e.message}")
 
