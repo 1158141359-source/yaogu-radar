@@ -3,313 +3,380 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <title>柚子六脉 · 短线量化终端</title>
+    <title>柚子六脉 · 纯前端量化终端</title>
     <style>
         :root {
-            --bg-color: #0b0e11;
-            --card-bg: #1e2329;
-            --card-bg-high: #2c1a1a; /* 高分红色背景 */
-            --text-main: #eaecef;
-            --text-sub: #848e9c;
-            --gold: #f0b90b;
-            --red: #f6465d;
-            --green: #0ecb81;
+            --bg: #f6f7f9; --card-bg: #ffffff; --text-main: #1f2329; --text-sub: #646a73;
+            --green: #00b42a; --red: #f53f3f; --yellow: #ff7d00; --blue: #165dff; --border: #e5e6eb;
         }
-        * {
-            box-sizing: border-box;
-            margin: 0;
-            padding: 0;
-            -webkit-tap-highlight-color: transparent;
-        }
-        body {
-            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-            background-color: var(--bg-color);
-            color: var(--text-main);
-            padding-bottom: 20px;
-        }
-        /* 顶部导航栏 */
-        .header {
-            position: sticky;
-            top: 0;
-            background-color: var(--bg-color);
-            padding: 15px 20px;
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            border-bottom: 1px solid #2b3139;
-            z-index: 10;
-        }
-        .header h1 {
-            font-size: 18px;
-            font-weight: 600;
-            color: var(--gold);
-        }
-        .header .date {
-            font-size: 12px;
-            color: var(--text-sub);
-        }
-        /* 列表容器 */
-        .stock-list {
-            padding: 15px;
-            display: flex;
-            flex-direction: column;
-            gap: 12px;
-        }
-        /* 股票卡片 */
-        .card {
-            background-color: var(--card-bg);
-            border-radius: 12px;
-            padding: 16px;
-            border: 1px solid #2b3139;
-            position: relative;
-            transition: all 0.2s ease;
-        }
-        /* 高分高亮样式 */
-        .card.high-score {
-            background-color: var(--card-bg-high);
-            border: 1px solid var(--red);
-            box-shadow: 0 0 10px rgba(246, 70, 93, 0.2);
-        }
-        .card.high-score::after {
-            content: "高分";
-            position: absolute;
-            top: -8px;
-            right: 15px;
-            background-color: var(--red);
-            color: white;
-            font-size: 10px;
-            padding: 2px 6px;
-            border-radius: 4px;
-            font-weight: bold;
-        }
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body { font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", sans-serif; background: var(--bg); color: var(--text-main); padding: 16px; line-height: 1.5; }
+        .container { max-width: 480px; margin: 0 auto; }
         
-        .card-top {
-            display: flex;
-            justify-content: space-between;
-            align-items: flex-start;
-            margin-bottom: 12px;
-        }
-        .card-title {
-            display: flex;
-            align-items: center;
-            gap: 8px;
-        }
-        .card-title h2 {
-            font-size: 17px;
-            font-weight: 600;
-        }
-        .card-title .code {
-            font-size: 13px;
-            color: var(--text-sub);
-            background: #2b3139;
-            padding: 2px 6px;
-            border-radius: 4px;
-        }
-        .rating-tag {
-            font-size: 11px;
-            padding: 2px 6px;
-            border-radius: 4px;
-            font-weight: bold;
-            border: 1px solid currentColor;
-        }
-        .rating-S { color: var(--red); background: rgba(246, 70, 93, 0.1); }
-        .rating-A { color: var(--gold); background: rgba(240, 185, 11, 0.1); }
-        .rating-B { color: var(--text-sub); background: rgba(132, 142, 156, 0.1); }
-        .rating-C { color: #666; background: rgba(102, 102, 102, 0.1); }
-
-        .score-box {
-            display: flex;
-            flex-direction: column;
-            align-items: flex-end;
-        }
-        .score-box .score {
-            font-size: 24px;
-            font-weight: 800;
-            color: var(--gold);
-            line-height: 1;
-        }
-        .high-score .score { color: var(--red); }
-        .score-box .label {
-            font-size: 11px;
-            color: var(--text-sub);
-            margin-top: 4px;
-        }
-
-        /* 数据网格 */
-        .card-grid {
-            display: grid;
-            grid-template-columns: 1fr 1fr 1fr 1fr;
-            gap: 10px;
-            border-top: 1px solid #2b3139;
-            padding-top: 12px;
-        }
-        .high-score .card-grid { border-top-color: rgba(246, 70, 93, 0.3); }
+        .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; }
+        .header h1 { font-size: 20px; font-weight: 600; display: flex; align-items: center; gap: 8px; }
+        .header .status { font-size: 12px; padding: 2px 8px; border-radius: 4px; font-weight: 500; }
+        .status.on { background: #e8f0fe; color: var(--blue); }
+        .status.off { background: #fff5f5; color: var(--red); }
         
-        .data-item {
-            display: flex;
-            flex-direction: column;
-            gap: 4px;
-        }
-        .data-item .label {
-            font-size: 11px;
-            color: var(--text-sub);
-        }
-        .data-item .value {
-            font-size: 13px;
-            font-weight: 500;
-        }
-        /* A股涨跌颜色 */
-        .chg-positive { color: var(--red); }
-        .chg-negative { color: var(--green); }
-        .chg-zero { color: var(--text-sub); }
-
-        /* 状态提示 */
-        .loading, .error, .empty {
-            text-align: center;
-            padding: 40px 20px;
-            color: var(--text-sub);
-            font-size: 14px;
-        }
-        .error { color: var(--red); }
-        .empty { color: var(--gold); }
+        .settings-bar { display: flex; justify-content: space-between; align-items: center; background: #fff; padding: 10px 16px; border-radius: 12px; margin-bottom: 16px; box-shadow: 0 2px 8px rgba(0,0,0,0.04); }
+        .settings-bar button { background: var(--blue); color: white; border: none; padding: 6px 12px; border-radius: 6px; font-size: 13px; cursor: pointer; }
         
-        .spinner {
-            display: inline-block;
-            width: 20px;
-            height: 20px;
-            border: 3px solid rgba(255,255,255,0.1);
-            border-radius: 50%;
-            border-top-color: var(--gold);
-            animation: spin 1s ease-in-out infinite;
-            margin-bottom: 10px;
-        }
-        @keyframes spin {
-            to { transform: rotate(360deg); }
-        }
+        /* 弹窗 */
+        .modal { display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.5); z-index: 100; justify-content: center; align-items: center; }
+        .modal-content { background: white; padding: 20px; border-radius: 12px; width: 90%; max-width: 400px; }
+        .modal-content h2 { font-size: 18px; margin-bottom: 12px; }
+        .modal-content input { width: 100%; padding: 10px; border: 1px solid var(--border); border-radius: 8px; margin-bottom: 12px; font-size: 14px; }
+        .modal-content .btn-group { display: flex; gap: 10px; justify-content: flex-end; }
+        .modal-content .btn-group button { padding: 8px 16px; border-radius: 8px; border: none; font-size: 14px; cursor: pointer; }
+        .modal-content .btn-group .save { background: var(--blue); color: white; }
+        .modal-content .btn-group .cancel { background: #f0f0f0; color: var(--text-main); }
+        
+        .card { background: var(--card-bg); border-radius: 12px; padding: 16px; margin-bottom: 16px; box-shadow: 0 2px 8px rgba(0,0,0,0.04); }
+        .card-title { font-size: 16px; font-weight: 600; margin-bottom: 12px; display: flex; align-items: center; gap: 8px; }
+        
+        .signal-list { display: flex; flex-direction: column; gap: 8px; }
+        .signal-item { font-size: 13px; display: flex; align-items: flex-start; gap: 6px; }
+        .signal-item .key { font-weight: 600; color: var(--red); width: 28px; flex-shrink: 0; }
+        .filter-box { background: #fff5f5; border: 1px solid #ffe3e3; padding: 10px 12px; border-radius: 8px; margin-top: 12px; font-size: 12px; color: #cf1322; }
+        
+        .section-header { display: flex; align-items: center; gap: 8px; font-size: 16px; font-weight: 600; margin-bottom: 12px; }
+        .section-header.green { color: var(--green); }
+        .section-header.yellow { color: var(--yellow); }
+        
+        .stock-row { display: flex; justify-content: space-between; align-items: center; padding: 12px 0; border-bottom: 1px solid var(--border); }
+        .stock-row:last-child { border-bottom: none; }
+        .stock-info { display: flex; flex-direction: column; gap: 4px; flex: 1; }
+        .stock-name { font-size: 15px; font-weight: 600; }
+        .stock-code { font-size: 12px; color: var(--text-sub); }
+        .stock-score { font-size: 18px; font-weight: 700; color: var(--green); padding-left: 12px; white-space: nowrap; }
+        
+        .tags-row { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+        .tag { font-size: 11px; padding: 2px 6px; border-radius: 4px; font-weight: 500; }
+        .tag.buy { background: #e8ffea; color: var(--green); }
+        .tag.watch { background: #fff7e8; color: var(--yellow); }
+        .tag.risk { background: #ffece8; color: var(--red); }
+        .tag.hold { background: #e8f0fe; color: var(--blue); }
+        .tag.sell { background: #ffece8; color: var(--red); }
+        
+        .near-miss-list { display: flex; flex-direction: column; gap: 12px; }
+        .near-item { background: #fafafa; border-radius: 8px; padding: 12px; }
+        .near-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
+        .near-reason { font-size: 12px; color: var(--red); background: #fff5f5; padding: 2px 6px; border-radius: 4px; }
+        
+        .footer { font-size: 11px; color: #86909c; text-align: center; margin-top: 24px; line-height: 1.6; }
+        .loading { text-align: center; padding: 20px; color: var(--text-sub); font-size: 13px; }
     </style>
 </head>
 <body>
-
+<div class="container">
     <div class="header">
-        <h1>⚡ 柚子六脉</h1>
-        <div class="date" id="data-date">数据加载中...</div>
+        <h1>🍊 柚子六脉</h1>
+        <span class="status off" id="status-tag">未接通</span>
+    </div>
+    
+    <div class="settings-bar">
+        <span style="font-size:14px; color:#646a73;">妙想 API Key</span>
+        <button onclick="openSettings()">参数设置</button>
     </div>
 
-    <div class="stock-list" id="stock-list">
-        <div class="loading">
-            <div class="spinner"></div>
-            <div>正在连接云端服务器...<br>首次唤醒可能需要1-2分钟，请耐心等待</div>
+    <div class="card">
+        <div class="card-title">第一层：选股硬条件 (5/5全满足)</div>
+        <div class="signal-list">
+            <div class="signal-item"><span class="key">C1</span>连续5日上涨：5日线向上且今日收盘>5日线</div>
+            <div class="signal-item"><span class="key">C2</span>30日内有过涨停：近期有涨停基因</div>
+            <div class="signal-item"><span class="key">C3</span>收盘不破5日线：现价站稳MA5</div>
+            <div class="signal-item"><span class="key">C4</span>堆量成交量：近5日均量比放大30%-80%</div>
+            <div class="signal-item"><span class="key">C5</span>底部筹码不动：获利盘60%-85%</div>
+        </div>
+        <div class="filter-box">🚫 风控过滤：非ST，总市值30-300亿。</div>
+    </div>
+
+    <div class="card">
+        <div class="section-header green"><span>✅</span> 严格命中 (5/5全满足)</div>
+        <div id="strict-list"><div class="loading">等待加载...</div></div>
+    </div>
+
+    <div class="card">
+        <div class="section-header yellow"><span>🎯</span> 最接近信号 (4/5，只差1条)</div>
+        <div id="near-list" class="near-miss-list"><div class="loading">等待加载...</div></div>
+    </div>
+
+    <div class="footer">说明：严格命中=5条全过；最接近=只过4条。<br>数据源：东方财富 + 妙想API。<br>无 Key 时 C5 筹码降级估算。</div>
+</div>
+
+<!-- 设置弹窗 -->
+<div class="modal" id="settings-modal">
+    <div class="modal-content">
+        <h2>设置妙想 API Key</h2>
+        <input type="password" id="api-key-input" placeholder="请输入你的 MX_APIKEY">
+        <div class="btn-group">
+            <button class="cancel" onclick="closeSettings()">取消</button>
+            <button class="save" onclick="saveSettings()">保存并生效</button>
         </div>
     </div>
+</div>
 
-    <script>
-        const API_URL = 'https://yaogu-radar-1.onrender.com/api/screen';
+<script>
+    // ================= 状态与本地存储 =================
+    let API_KEY = localStorage.getItem('mx_api_key') || '';
+    const API_KEY_STORAGE = 'mx_api_key';
+    
+    function updateStatus() {
+        const tag = document.getElementById('status-tag');
+        if (API_KEY) {
+            tag.textContent = '已接通';
+            tag.className = 'status on';
+        } else {
+            tag.textContent = '未接通';
+            tag.className = 'status off';
+        }
+    }
+    
+    function openSettings() {
+        document.getElementById('api-key-input').value = API_KEY;
+        document.getElementById('settings-modal').style.display = 'flex';
+    }
+    function closeSettings() { document.getElementById('settings-modal').style.display = 'none'; }
+    function saveSettings() {
+        const val = document.getElementById('api-key-input').value.trim();
+        API_KEY = val;
+        localStorage.setItem(API_KEY_STORAGE, val);
+        closeSettings();
+        updateStatus();
+        fetchData(); // 重新跑一次数据
+    }
 
-        async function fetchStockData() {
-            const listContainer = document.getElementById('stock-list');
-            const dateContainer = document.getElementById('data-date');
+    // ================= 网络请求与逻辑 =================
+    const MX_API_URL = 'https://mkapi2.dfcfs.com/finskillshub/api/claw/stock-screen';
 
-            try {
-                const response = await fetch(API_URL, {
-                    method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json'
-                    },
-                    body: JSON.stringify({
-                        mv_min: 30,
-                        mv_max: 300,
-                        profit_min: 60,
-                        profit_max: 85
-                    })
-                });
+    // 1. 请求妙想获取候选池
+    async function fetchMiaoXiang() {
+        if (!API_KEY) return null;
+        try {
+            const response = await fetch(MX_API_URL, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'apikey': API_KEY
+                },
+                body: JSON.stringify({
+                    keyword: "非ST，总市值30亿到300亿，近30日内有涨停",
+                    pageNo: 1,
+                    pageSize: 50
+                })
+            });
+            const result = await response.json();
+            if (result.code !== 0) throw new Error(result.message || '妙想请求失败');
+            // 解析返回值，兼容不同结构
+            const d = result.data?.data || result.data || {};
+            const list = d.allResults?.result?.dataList || d.result?.dataList || [];
+            return list;
+        } catch (e) {
+            console.error("妙想接口报错:", e);
+            return null;
+        }
+    }
 
-                if (!response.ok) {
-                    throw new Error(`接口返回错误: ${response.status}`);
-                }
+    // 2. 请求东财获取历史K线 (直接前端请求，需处理跨域)
+    async function fetchEastMoneyKline(code) {
+        // 处理市场前缀 (1=沪市, 0=深市)
+        const prefix = code.startsWith("6") ? "1" : "0";
+        const secid = `${prefix}.${code}`;
+        const url = `https://push2his.eastmoney.com/api/qt/stock/kline/get?secid=${secid}&fields1=f1,f2,f3,f4,f5&fields2=f51,f52,f53,f54,f55,f56,f57&klt=101&fqt=1&beg=0&end=20500000&lmt=30`;
+        
+        try {
+            const response = await fetch(url);
+            const data = await response.json();
+            const klines = data.data?.klines || [];
+            return klines.map(line => {
+                const parts = line.split(",");
+                return {
+                    date: parts[0], open: parseFloat(parts[1]), close: parseFloat(parts[2]),
+                    high: parseFloat(parts[3]), low: parseFloat(parts[4]), volume: parseFloat(parts[5])
+                };
+            });
+        } catch (e) {
+            console.error(`东财K线获取失败 ${code}:`, e);
+            return [];
+        }
+    }
 
-                const result = await response.json();
-                
-                if (result.code !== 200) {
-                    throw new Error(result.msg || '接口返回异常');
-                }
-
-                dateContainer.textContent = `更新: ${result.data_date || '无'}`;
-
-                const stocks = result.data;
-                if (!stocks || stocks.length === 0) {
-                    listContainer.innerHTML = '<div class="empty">今日暂无符合条件股票</div>';
-                    return;
-                }
-
-                renderStocks(stocks, listContainer);
-
-            } catch (error) {
-                console.error(error);
-                listContainer.innerHTML = `<div class="error">
-                    连接失败：${error.message}<br><br>
-                    提示：Render免费服务可能正在休眠，请下拉刷新重试。
-                </div>`;
-            }
+    // 3. 核心分析逻辑
+    async function analyzeStock(stock) {
+        const code = stock.SECURITY_CODE || stock.code;
+        const name = stock.SECURITY_SHORT_NAME || stock.name;
+        const price = parseFloat(stock.NEWEST_PRICE || stock.price || 0);
+        const chg = parseFloat(stock.CHG || stock.chg || 0);
+        const profitRatio = parseFloat(stock['010000_HLP'] || stock.profit_ratio || 0);
+        const limitUp = parseFloat(stock['010000_DURATION_LIMIT_UP'] || stock.limit_up_count || 0);
+        const volumeRatio = parseFloat(stock['010000_LIANGBI'] || stock.volume_ratio || 0);
+        
+        // 获取K线
+        const klines = await fetchEastMoneyKline(code);
+        if (!klines || klines.length < 10) {
+            return { code, name, score: 0, rating: '数据不足', error: 'K线数据缺失', timing_tags: [], holding_tags: [], hard_conditions: [] };
         }
 
-        function renderStocks(stocks, container) {
-            container.innerHTML = ''; // 清空加载提示
+        // 计算指标
+        const closes = klines.map(k => k.close);
+        const volumes = klines.map(k => k.volume);
+        const highs = klines.map(k => k.high);
+        const lows = klines.map(k => k.low);
+        
+        const ma5 = closes.slice(-5).reduce((a,b)=>a+b,0) / 5;
+        const v_ma5 = volumes.slice(-5).reduce((a,b)=>a+b,0) / 5;
+        const v_ma5_prev = volumes.slice(-10,-5).reduce((a,b)=>a+b,0) / 5;
+        
+        const today = klines[klines.length - 1];
+        const yesterday = klines[klines.length - 2] || today;
+        
+        // --- 第一层：硬条件判断 (5条) ---
+        let score = 0;
+        const hard_conditions = [];
 
-            stocks.forEach(stock => {
-                const score = stock.score || 0;
-                const rating = stock.rating || 'B';
-                const isHighScore = score >= 90;
-                
-                // 处理涨跌颜色
-                const chg = stock.chg || 0;
-                let chgClass = 'chg-zero';
-                let chgSign = '';
-                if (chg > 0) { chgClass = 'chg-positive'; chgSign = '+'; }
-                if (chg < 0) { chgClass = 'chg-negative'; }
+        // C1 连阳趋势
+        const is5dUp = closes.slice(-5).every((c, i) => c > ma5);
+        const c1 = is5dUp && price > ma5;
+        hard_conditions.push({ name: "连续5日上涨", pass: c1, desc: `5日线 ${ma5.toFixed(2)}，现价 ${price}` });
+        if (c1) score += 20;
 
-                // 处理评级标签样式
-                const ratingClass = `rating-${rating}`;
+        // C2 涨停基因
+        const c2 = limitUp > 0;
+        hard_conditions.push({ name: "30日内有过涨停", pass: c2, desc: `涨停 ${limitUp} 次` });
+        if (c2) score += 20;
 
-                const card = document.createElement('div');
-                card.className = `card ${isHighScore ? 'high-score' : ''}`;
-                
-                card.innerHTML = `
-                    <div class="card-top">
-                        <div class="card-title">
-                            <h2>${stock.name || '未知'}</h2>
-                            <span class="code">${stock.code || ''}</span>
-                            <span class="rating-tag ${ratingClass}">${rating === 'S' ? '严格命中' : (rating === 'A' ? '重点关注' : '观察')}</span>
-                        </div>
-                        <div class="score-box">
-                            <div class="score">${score}</div>
-                            <div class="label">妖股指数</div>
+        // C3 守线
+        const c3 = price >= ma5;
+        hard_conditions.push({ name: "收盘不破5日线", pass: c3, desc: `现价 ${price} vs MA5 ${ma5.toFixed(2)}` });
+        if (c3) score += 20;
+
+        // C4 堆量
+        const volRatio5d = v_ma5_prev > 0 ? (v_ma5 / v_ma5_prev) : 0;
+        const c4 = volRatio5d >= 1.3 && volRatio5d <= 1.8;
+        hard_conditions.push({ name: "堆量成交量", pass: c4, desc: `5日均量比 ${volRatio5d.toFixed(2)}` });
+        if (c4) score += 20;
+
+        // C5 底部筹码不动 (有Key用原生，没Key用估算)
+        let c5;
+        let c5Desc;
+        if (API_KEY) {
+            c5 = profitRatio >= 60 && profitRatio <= 85;
+            c5Desc = `获利盘 ${profitRatio.toFixed(2)}% (原生)`;
+        } else {
+            // 估算：假设当前价在近期高低点之间的位置
+            const recentHigh = Math.max(...highs.slice(-20));
+            const recentLow = Math.min(...lows.slice(-20));
+            const estimateProfit = recentHigh > recentLow ? ((price - recentLow) / (recentHigh - recentLow)) * 100 : 50;
+            c5 = estimateProfit >= 60 && estimateProfit <= 85;
+            c5Desc = `获利盘 ${estimateProfit.toFixed(1)}% (估算)`;
+        }
+        hard_conditions.push({ name: "底部筹码不动", pass: c5, desc: c5Desc });
+        if (c5) score += 20;
+
+        // --- 第二层：买卖时机提示 ---
+        const timing_tags = [];
+        if (chg < -3 && price > today.low && price > yesterday.low) timing_tags.push({ type: "buy", text: "🟢 援军战法：重挫企稳" });
+        if (chg < 0 && (today.high - price) > (price - today.low) * 1.5) timing_tags.push({ type: "buy", text: "🟢 反转阴线" });
+        if ((today.high - price) > price * 0.03 && price > ma5) timing_tags.push({ type: "watch", text: "🟡 仙人指路" });
+        if (chg < -3 && price < ma5) timing_tags.push({ type: "risk", text: "🔴 破位阴线" });
+        if (timing_tags.length === 0) timing_tags.push({ type: "watch", text: "🟡 暂无明确时机信号" });
+
+        // --- 第三层：持股/卖出规则提示 ---
+        const holding_tags = [];
+        const hHigh = today.high > yesterday.high;
+        const hLow = today.low > yesterday.low;
+        const hClose = today.close > yesterday.close;
+        if (hHigh && hLow && hClose) {
+            holding_tags.push({ type: "hold", text: "🟢 持股：高点高 + 低点高 + 收盘高" });
+        } else if (!hHigh) {
+            holding_tags.push({ type: "sell", text: "🔴 卖出提示：高点不创新高" });
+        } else {
+            holding_tags.push({ type: "hold", text: "🟡 震荡：等待方向" });
+        }
+
+        return {
+            code, name, price, score, 
+            rating: score === 100 ? 'S' : (score >= 80 ? 'A' : (score >= 60 ? 'B' : 'C')),
+            hard_conditions, timing_tags, holding_tags
+        };
+    }
+
+    // ================= 主渲染逻辑 =================
+    async function fetchData() {
+        const strictList = document.getElementById('strict-list');
+        const nearList = document.getElementById('near-list');
+        
+        strictList.innerHTML = '<div class="loading">正在计算...（首次需从东财拉取K线，请耐心等待）</div>';
+        nearList.innerHTML = '<div class="loading">正在计算...</div>';
+        
+        let candidates = [];
+        if (API_KEY) {
+            candidates = await fetchMiaoXiang();
+        }
+        
+        if (!candidates || candidates.length === 0) {
+            strictList.innerHTML = `<div class="loading" style="color:#f53f3f;">未获取到候选池。请检查Key或稍后重试。</div>`;
+            nearList.innerHTML = '';
+            return;
+        }
+
+        const analyzedData = [];
+        // 限制并发，防止卡死
+        for (let i = 0; i < Math.min(candidates.length, 30); i++) {
+            const result = await analyzeStock(candidates[i]);
+            if (result.score > 0) analyzedData.push(result);
+        }
+        
+        analyzedData.sort((a, b) => b.score - a.score);
+        const strict = analyzedData.filter(s => s.score === 100);
+        const near = analyzedData.filter(s => s.score === 80);
+
+        // 渲染严格命中
+        if (strict.length === 0) {
+            strictList.innerHTML = '<div class="loading">今日暂无严格命中</div>';
+        } else {
+            strictList.innerHTML = strict.slice(0, 3).map(s => `
+                <div class="stock-row">
+                    <div class="stock-info">
+                        <div class="stock-name">${s.name} <span class="stock-code">${s.code}</span></div>
+                        <div class="tags-row">
+                            ${s.timing_tags.map(t => `<span class="tag ${t.type}">${t.text}</span>`).join('')}
+                            ${s.holding_tags.map(t => `<span class="tag ${t.type}">${t.text}</span>`).join('')}
                         </div>
                     </div>
-                    <div class="card-grid">
-                        <div class="data-item">
-                            <span class="label">涨跌幅</span>
-                            <span class="value ${chgClass}">${chgSign}${chg.toFixed(2)}%</span>
+                    <div class="stock-score">${s.score}分</div>
+                </div>
+            `).join('');
+        }
+
+        // 渲染最接近信号
+        if (near.length === 0) {
+            nearList.innerHTML = '<div class="loading">暂无最接近信号</div>';
+        } else {
+            nearList.innerHTML = near.slice(0, 5).map(s => {
+                const failed = s.hard_conditions.find(c => !c.pass);
+                return `
+                    <div class="near-item">
+                        <div class="near-header">
+                            <div class="stock-name">${s.name} <span class="stock-code">${s.code}</span></div>
+                            <div class="near-reason">差 ${failed ? failed.name : '1条'}</div>
                         </div>
-                        <div class="data-item">
-                            <span class="label">换手率</span>
-                            <span class="value">${(stock.turnover_rate || 0).toFixed(2)}%</span>
-                        </div>
-                        <div class="data-item">
-                            <span class="label">量比</span>
-                            <span class="value">${(stock.volume_ratio || 0).toFixed(2)}</span>
-                        </div>
-                        <div class="data-item">
-                            <span class="label">获利盘</span>
-                            <span class="value">${(stock.profit_ratio || 0).toFixed(2)}%</span>
+                        <div class="tags-row">
+                            ${s.timing_tags.map(t => `<span class="tag ${t.type}">${t.text}</span>`).join('')}
+                            ${s.holding_tags.map(t => `<span class="tag ${t.type}">${t.text}</span>`).join('')}
                         </div>
                     </div>
                 `;
-                container.appendChild(card);
-            });
+            }).join('');
         }
+    }
 
-        // 页面加载时执行
-        window.onload = fetchStockData;
-    </script>
+    // 页面加载时执行
+    window.onload = () => {
+        updateStatus();
+        fetchData();
+    };
+</script>
 </body>
 </html>
