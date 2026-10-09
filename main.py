@@ -302,10 +302,13 @@ class ScreenRequest(BaseModel):
     profit_min: float = 60
     profit_max: float = 85
 
+from fastapi.responses import RedirectResponse
+
 @app.get("/")
 def read_root():
-    return {"status": "ok", "message": "妖股雷达服务已启动，请访问 /docs 测试接口"}
-
+    # 自动跳转到 /docs 文档页面
+    return RedirectResponse(url="/docs")
+    
 @app.post("/api/screen")
 async def screen_stocks(req: ScreenRequest):
     try:
