@@ -224,7 +224,65 @@ def liumei_coarse_keyword(*, mv_min: int = 30, mv_max: int = 300, limit_up_days:
 
 def screen_liumei(**kw) -> dict:
     return stock_screen(liumei_coarse_keyword(**kw))
-
+# ==========================================
+# 模块一.5：本地精算引擎 (柚子六脉)
+# ==========================================
+def local_filter_liumei(candidates: list[dict]) -> list[dict]:
+    """接收妙想粗筛出的候选池，用历史K线计算真正的 C1-C6"""
+    final_results = []
+    
+    for stock in candidates:
+        code = stock.get('code')
+        # 获取过去30天K线，数据不足20天直接跳过（防次新股报错）
+        df = get_kline(code)
+        if df is None or len(df) < 20:
+            continue 
+        
+        close = df['收盘']
+        volume = df['成交量']
+        
+        # 1. 计算均线
+        ma5 = close.rolling(5).mean()
+        ma10 = close.rolling(10).mean()
+        ma20 = close.rolling(20).mean()
+        
+        # 2. 核心六脉计算
+        # C1 连阳趋势：5日收盘在5日线上，且5日累计涨幅在 5% ~ 15%
+        c1_cond = all(close.tail(5) > ma5.tail(5)) and (5 <= (close.iloc[-1] / close.iloc[-6] - 1) * 100 <= 15)
+        
+        # C3 守线：均线多头排列，且收盘价在5日线上
+        c3_cond = (ma5.iloc[-1] > ma10.iloc[-1] > ma20.iloc[-1]) and (close.iloc[-1] > ma5.iloc[-1])
+        
+        # C4 堆量：近5日均量比前5日放大 30% ~ 80%
+        vol_ma5 = volume.rolling(5).mean()
+        c4_cond = 1.3 <= (vol_ma5.iloc[-1] / vol_ma5.iloc[-6]) <= 1.8
+        
+        # C5 抛压竭：D-1缩量（小于前日70%）且微跌（-3% ~ 0%）
+        c5_cond = (volume.iloc[-2] < volume.iloc[-3] * 0.7) and (-3 < (close.iloc[-2] / close.iloc[-3] - 1) * 100 < 0)
+        
+        # 3. 计算总分（每项满分约16.6，咱们这里简单加权）
+        score = 0
+        if c1_cond: score += 16.6
+        if c3_cond: score += 16.6
+        if c4_cond: score += 16.6
+        if c5_cond: score += 16.6
+        
+        # C2（涨停基因）和 C6（筹码锁定）妙想粗筛已经筛选了，这里默认给分
+        score += 33.2 
+        
+        # 4. 风控红线（一票否决）
+        profit_ratio = stock.get('profit_ratio', 0)
+        if profit_ratio > 85 or profit_ratio < 60:
+            score = min(score, 50) # 筹码极不健康，强制降级
+        if not c5_cond:
+            score = min(score, 65) # 抛压不合格，强制降级
+            
+        # 5. 封装结果
+        stock['score'] = round(score, 1)
+        stock['rating'] = 'S' if score >= 85 else ('A' if score >= 65 else 'B')
+        final_results.append(stock)
+        
+    return final_results
 # ==========================================
 # 模块二：FastAPI Web 服务
 # ==========================================
