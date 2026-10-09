@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <title>柚子六脉 · 纯前端量化终端</title>
+    <title>柚子六脉 · 量化终端</title>
     <style>
         :root {
             --bg: #f6f7f9; --card-bg: #ffffff; --text-main: #1f2329; --text-sub: #646a73;
@@ -120,7 +120,6 @@
 <script>
     // ================= 状态与本地存储 =================
     let API_KEY = localStorage.getItem('mx_api_key') || '';
-    const API_KEY_STORAGE = 'mx_api_key';
     
     function updateStatus() {
         const tag = document.getElementById('status-tag');
@@ -139,237 +138,97 @@
     }
     function closeSettings() { document.getElementById('settings-modal').style.display = 'none'; }
     function saveSettings() {
-        const val = document.getElementById('api-key-input').value.trim();
-        API_KEY = val;
-        localStorage.setItem(API_KEY_STORAGE, val);
+        API_KEY = document.getElementById('api-key-input').value.trim();
+        localStorage.setItem('mx_api_key', API_KEY);
         closeSettings();
         updateStatus();
         fetchData(); // 重新跑一次数据
     }
 
-    // ================= 网络请求与逻辑 =================
-    const MX_API_URL = 'https://mkapi2.dfcfs.com/finskillshub/api/claw/stock-screen';
+    // ================= 请求后端接口 =================
+    // 这里改为请求你部署在 Render 的地址
+    const API_URL = 'https://yaogu-radar-1.onrender.com/api/screen';
 
-    // 1. 请求妙想获取候选池
-    async function fetchMiaoXiang() {
-        if (!API_KEY) return null;
-        try {
-            const response = await fetch(MX_API_URL, {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                    'apikey': API_KEY
-                },
-                body: JSON.stringify({
-                    keyword: "非ST，总市值30亿到300亿，近30日内有涨停",
-                    pageNo: 1,
-                    pageSize: 50
-                })
-            });
-            const result = await response.json();
-            if (result.code !== 0) throw new Error(result.message || '妙想请求失败');
-            // 解析返回值，兼容不同结构
-            const d = result.data?.data || result.data || {};
-            const list = d.allResults?.result?.dataList || d.result?.dataList || [];
-            return list;
-        } catch (e) {
-            console.error("妙想接口报错:", e);
-            return null;
-        }
-    }
-
-    // 2. 请求东财获取历史K线 (直接前端请求，需处理跨域)
-    async function fetchEastMoneyKline(code) {
-        // 处理市场前缀 (1=沪市, 0=深市)
-        const prefix = code.startsWith("6") ? "1" : "0";
-        const secid = `${prefix}.${code}`;
-        const url = `https://push2his.eastmoney.com/api/qt/stock/kline/get?secid=${secid}&fields1=f1,f2,f3,f4,f5&fields2=f51,f52,f53,f54,f55,f56,f57&klt=101&fqt=1&beg=0&end=20500000&lmt=30`;
-        
-        try {
-            const response = await fetch(url);
-            const data = await response.json();
-            const klines = data.data?.klines || [];
-            return klines.map(line => {
-                const parts = line.split(",");
-                return {
-                    date: parts[0], open: parseFloat(parts[1]), close: parseFloat(parts[2]),
-                    high: parseFloat(parts[3]), low: parseFloat(parts[4]), volume: parseFloat(parts[5])
-                };
-            });
-        } catch (e) {
-            console.error(`东财K线获取失败 ${code}:`, e);
-            return [];
-        }
-    }
-
-    // 3. 核心分析逻辑
-    async function analyzeStock(stock) {
-        const code = stock.SECURITY_CODE || stock.code;
-        const name = stock.SECURITY_SHORT_NAME || stock.name;
-        const price = parseFloat(stock.NEWEST_PRICE || stock.price || 0);
-        const chg = parseFloat(stock.CHG || stock.chg || 0);
-        const profitRatio = parseFloat(stock['010000_HLP'] || stock.profit_ratio || 0);
-        const limitUp = parseFloat(stock['010000_DURATION_LIMIT_UP'] || stock.limit_up_count || 0);
-        const volumeRatio = parseFloat(stock['010000_LIANGBI'] || stock.volume_ratio || 0);
-        
-        // 获取K线
-        const klines = await fetchEastMoneyKline(code);
-        if (!klines || klines.length < 10) {
-            return { code, name, score: 0, rating: '数据不足', error: 'K线数据缺失', timing_tags: [], holding_tags: [], hard_conditions: [] };
-        }
-
-        // 计算指标
-        const closes = klines.map(k => k.close);
-        const volumes = klines.map(k => k.volume);
-        const highs = klines.map(k => k.high);
-        const lows = klines.map(k => k.low);
-        
-        const ma5 = closes.slice(-5).reduce((a,b)=>a+b,0) / 5;
-        const v_ma5 = volumes.slice(-5).reduce((a,b)=>a+b,0) / 5;
-        const v_ma5_prev = volumes.slice(-10,-5).reduce((a,b)=>a+b,0) / 5;
-        
-        const today = klines[klines.length - 1];
-        const yesterday = klines[klines.length - 2] || today;
-        
-        // --- 第一层：硬条件判断 (5条) ---
-        let score = 0;
-        const hard_conditions = [];
-
-        // C1 连阳趋势
-        const is5dUp = closes.slice(-5).every((c, i) => c > ma5);
-        const c1 = is5dUp && price > ma5;
-        hard_conditions.push({ name: "连续5日上涨", pass: c1, desc: `5日线 ${ma5.toFixed(2)}，现价 ${price}` });
-        if (c1) score += 20;
-
-        // C2 涨停基因
-        const c2 = limitUp > 0;
-        hard_conditions.push({ name: "30日内有过涨停", pass: c2, desc: `涨停 ${limitUp} 次` });
-        if (c2) score += 20;
-
-        // C3 守线
-        const c3 = price >= ma5;
-        hard_conditions.push({ name: "收盘不破5日线", pass: c3, desc: `现价 ${price} vs MA5 ${ma5.toFixed(2)}` });
-        if (c3) score += 20;
-
-        // C4 堆量
-        const volRatio5d = v_ma5_prev > 0 ? (v_ma5 / v_ma5_prev) : 0;
-        const c4 = volRatio5d >= 1.3 && volRatio5d <= 1.8;
-        hard_conditions.push({ name: "堆量成交量", pass: c4, desc: `5日均量比 ${volRatio5d.toFixed(2)}` });
-        if (c4) score += 20;
-
-        // C5 底部筹码不动 (有Key用原生，没Key用估算)
-        let c5;
-        let c5Desc;
-        if (API_KEY) {
-            c5 = profitRatio >= 60 && profitRatio <= 85;
-            c5Desc = `获利盘 ${profitRatio.toFixed(2)}% (原生)`;
-        } else {
-            // 估算：假设当前价在近期高低点之间的位置
-            const recentHigh = Math.max(...highs.slice(-20));
-            const recentLow = Math.min(...lows.slice(-20));
-            const estimateProfit = recentHigh > recentLow ? ((price - recentLow) / (recentHigh - recentLow)) * 100 : 50;
-            c5 = estimateProfit >= 60 && estimateProfit <= 85;
-            c5Desc = `获利盘 ${estimateProfit.toFixed(1)}% (估算)`;
-        }
-        hard_conditions.push({ name: "底部筹码不动", pass: c5, desc: c5Desc });
-        if (c5) score += 20;
-
-        // --- 第二层：买卖时机提示 ---
-        const timing_tags = [];
-        if (chg < -3 && price > today.low && price > yesterday.low) timing_tags.push({ type: "buy", text: "🟢 援军战法：重挫企稳" });
-        if (chg < 0 && (today.high - price) > (price - today.low) * 1.5) timing_tags.push({ type: "buy", text: "🟢 反转阴线" });
-        if ((today.high - price) > price * 0.03 && price > ma5) timing_tags.push({ type: "watch", text: "🟡 仙人指路" });
-        if (chg < -3 && price < ma5) timing_tags.push({ type: "risk", text: "🔴 破位阴线" });
-        if (timing_tags.length === 0) timing_tags.push({ type: "watch", text: "🟡 暂无明确时机信号" });
-
-        // --- 第三层：持股/卖出规则提示 ---
-        const holding_tags = [];
-        const hHigh = today.high > yesterday.high;
-        const hLow = today.low > yesterday.low;
-        const hClose = today.close > yesterday.close;
-        if (hHigh && hLow && hClose) {
-            holding_tags.push({ type: "hold", text: "🟢 持股：高点高 + 低点高 + 收盘高" });
-        } else if (!hHigh) {
-            holding_tags.push({ type: "sell", text: "🔴 卖出提示：高点不创新高" });
-        } else {
-            holding_tags.push({ type: "hold", text: "🟡 震荡：等待方向" });
-        }
-
-        return {
-            code, name, price, score, 
-            rating: score === 100 ? 'S' : (score >= 80 ? 'A' : (score >= 60 ? 'B' : 'C')),
-            hard_conditions, timing_tags, holding_tags
-        };
-    }
-
-    // ================= 主渲染逻辑 =================
     async function fetchData() {
         const strictList = document.getElementById('strict-list');
         const nearList = document.getElementById('near-list');
         
-        strictList.innerHTML = '<div class="loading">正在计算...（首次需从东财拉取K线，请耐心等待）</div>';
+        strictList.innerHTML = '<div class="loading">正在计算...（首次打开请耐心等待冷启动）</div>';
         nearList.innerHTML = '<div class="loading">正在计算...</div>';
         
-        let candidates = [];
-        if (API_KEY) {
-            candidates = await fetchMiaoXiang();
+        try {
+            // 👇 这里就是把 Key 放在 body 里传给后端的关键代码 👇
+            const response = await fetch(API_URL, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ 
+                    mv_min: 30, 
+                    mv_max: 300, 
+                    api_key: API_KEY || "" // 如果有 Key 就传过去，没有就传空字符串
+                })
+            });
+            
+            if (!response.ok) {
+                const errData = await response.json();
+                throw new Error(errData.detail || '接口请求失败');
+            }
+            
+            const result = await response.json();
+            
+            if (result.code !== 200) {
+                throw new Error(result.msg || '接口返回异常');
+            }
+
+            renderStrict(result.strict_hits, strictList);
+            renderNear(result.near_hits, nearList);
+
+        } catch (error) {
+            console.error(error);
+            strictList.innerHTML = `<div class="loading" style="color:#f53f3f;">加载失败：${error.message}<br>请检查网络或稍后重试</div>`;
+            nearList.innerHTML = `<div class="loading" style="color:#f53f3f;">加载失败</div>`;
         }
-        
-        if (!candidates || candidates.length === 0) {
-            strictList.innerHTML = `<div class="loading" style="color:#f53f3f;">未获取到候选池。请检查Key或稍后重试。</div>`;
-            nearList.innerHTML = '';
+    }
+
+    function renderStrict(stocks, container) {
+        if (!stocks || stocks.length === 0) {
+            container.innerHTML = `<div class="loading">今日暂无严格命中股票</div>`;
             return;
         }
-
-        const analyzedData = [];
-        // 限制并发，防止卡死
-        for (let i = 0; i < Math.min(candidates.length, 30); i++) {
-            const result = await analyzeStock(candidates[i]);
-            if (result.score > 0) analyzedData.push(result);
-        }
-        
-        analyzedData.sort((a, b) => b.score - a.score);
-        const strict = analyzedData.filter(s => s.score === 100);
-        const near = analyzedData.filter(s => s.score === 80);
-
-        // 渲染严格命中
-        if (strict.length === 0) {
-            strictList.innerHTML = '<div class="loading">今日暂无严格命中</div>';
-        } else {
-            strictList.innerHTML = strict.slice(0, 3).map(s => `
-                <div class="stock-row">
-                    <div class="stock-info">
-                        <div class="stock-name">${s.name} <span class="stock-code">${s.code}</span></div>
-                        <div class="tags-row">
-                            ${s.timing_tags.map(t => `<span class="tag ${t.type}">${t.text}</span>`).join('')}
-                            ${s.holding_tags.map(t => `<span class="tag ${t.type}">${t.text}</span>`).join('')}
-                        </div>
+        container.innerHTML = stocks.map(stock => `
+            <div class="stock-row">
+                <div class="stock-info">
+                    <div class="stock-name">${stock.name} <span class="stock-code">${stock.code}</span></div>
+                    <div class="tags-row">
+                        ${stock.timing_tags.map(t => `<span class="tag ${t.type}">${t.text}</span>`).join('')}
+                        ${stock.holding_tags.map(t => `<span class="tag ${t.type}">${t.text}</span>`).join('')}
                     </div>
-                    <div class="stock-score">${s.score}分</div>
                 </div>
-            `).join('');
-        }
+                <div class="stock-score">${stock.score}分</div>
+            </div>
+        `).join('');
+    }
 
-        // 渲染最接近信号
-        if (near.length === 0) {
-            nearList.innerHTML = '<div class="loading">暂无最接近信号</div>';
-        } else {
-            nearList.innerHTML = near.slice(0, 5).map(s => {
-                const failed = s.hard_conditions.find(c => !c.pass);
-                return `
-                    <div class="near-item">
-                        <div class="near-header">
-                            <div class="stock-name">${s.name} <span class="stock-code">${s.code}</span></div>
-                            <div class="near-reason">差 ${failed ? failed.name : '1条'}</div>
-                        </div>
-                        <div class="tags-row">
-                            ${s.timing_tags.map(t => `<span class="tag ${t.type}">${t.text}</span>`).join('')}
-                            ${s.holding_tags.map(t => `<span class="tag ${t.type}">${t.text}</span>`).join('')}
-                        </div>
-                    </div>
-                `;
-            }).join('');
+    function renderNear(stocks, container) {
+        if (!stocks || stocks.length === 0) {
+            container.innerHTML = `<div class="loading">暂无最接近信号</div>`;
+            return;
         }
+        container.innerHTML = stocks.map(stock => {
+            const failed = stock.hard_conditions.find(c => !c.pass);
+            const reason = failed ? `差 ${failed.name}` : '差1条条件';
+            return `
+                <div class="near-item">
+                    <div class="near-header">
+                        <div class="stock-name">${stock.name} <span class="stock-code">${stock.code}</span></div>
+                        <div class="near-reason">${reason}</div>
+                    </div>
+                    <div class="tags-row">
+                        ${stock.timing_tags.map(t => `<span class="tag ${t.type}">${t.text}</span>`).join('')}
+                        ${stock.holding_tags.map(t => `<span class="tag ${t.type}">${t.text}</span>`).join('')}
+                    </div>
+                </div>
+            `;
+        }).join('');
     }
 
     // 页面加载时执行
