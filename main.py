@@ -218,7 +218,6 @@ def analyze_stock(stock: dict) -> dict:
     hard_conditions.append({"name": "堆量成交量", "pass": c4, "desc": f"5日均量比 {vol_ratio_5d:.2f}"})
     if c4: score += 20
 
-    # 如果有Key，C5用原生获利盘；没Key则没有数据（前端已做降级处理）
     c5 = (60 <= profit_ratio <= 85)
     hard_conditions.append({"name": "底部筹码不动", "pass": c5, "desc": f"获利盘 {profit_ratio}%"})
     if c5: score += 20
@@ -254,15 +253,27 @@ def analyze_stock(stock: dict) -> dict:
 
 def local_filter_liumei(candidates: list[dict]) -> dict:
     final_data = []
+    data_insufficient = []
+    
     for stock in candidates[:30]:
         analyzed = analyze_stock(stock)
-        final_data.append(analyzed)
+        if analyzed.get('score') == 0 and analyzed.get('error') == 'K线缺失':
+            data_insufficient.append(analyzed)
+        else:
+            final_data.append(analyzed)
     
     final_data.sort(key=lambda x: x['score'], reverse=True)
-    strict_hits = [s for s in final_data if s['score'] == 100]
-    near_hits = [s for s in final_data if s['score'] == 80]
     
-    return {"strict_hits": strict_hits[:3], "near_hits": near_hits[:5], "all_data": final_data}
+    strict_hits = [s for s in final_data if s['score'] == 100]
+    # 放宽标准，让60分以上都能展示
+    near_hits = [s for s in final_data if s['score'] >= 60]
+    
+    return {
+        "strict_hits": strict_hits[:3],
+        "near_hits": near_hits[:5],
+        "data_insufficient": data_insufficient[:5],
+        "all_data": final_data
+    }
 
 
 # ==========================================
@@ -274,16 +285,13 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 class ScreenRequest(BaseModel):
     mv_min: int = 30
     mv_max: int = 300
-    api_key: str = ""  # 接收前端传来的Key，但不存储
+    api_key: str = ""
 
 @app.post("/api/screen")
 async def screen_stocks(req: ScreenRequest):
     try:
-        # 1. 使用前端传来的Key进行妙想粗筛
         kw = f"非ST，总市值{req.mv_min}亿到{req.mv_max}亿，近30日内有涨停"
         coarse_data = stock_screen(kw, api_key=req.api_key)
-        
-        # 2. 后端去抓东财K线并精算
         result = local_filter_liumei(coarse_data.get('rows', []))
         
         return {
@@ -291,7 +299,8 @@ async def screen_stocks(req: ScreenRequest):
             "total_strict": len(result['strict_hits']),
             "total_near": len(result['near_hits']),
             "strict_hits": result['strict_hits'],
-            "near_hits": result['near_hits']
+            "near_hits": result['near_hits'],
+            "data_insufficient": result['data_insufficient']
         }
     except MiaoXiangError as e:
         raise HTTPException(status_code=400, detail=f"妙想API调用失败: {e.message}")
