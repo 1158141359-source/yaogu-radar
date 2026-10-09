@@ -5,7 +5,7 @@ from pydantic import BaseModel
 import os
 import json
 import datetime
-import akshare as ak
+import pandas as pd
 import re
 import time
 import urllib.error
@@ -184,6 +184,11 @@ def stock_screen(keyword: str, page_no: int = 1, page_size: int = 50, api_key: s
         if len(meta) == 10 and meta[4] == "-": out["data_date"] = meta; break
     return out
 
+def query(tool_query: str, api_key: str | None = None) -> dict:
+    """自然语言查数（历史行情、财务等）"""
+    res = _check_biz(call("/api/claw/query", {"toolQuery": tool_query}, api_key=api_key))
+    return _dig(res, "data", "data") or {}
+
 def liumei_coarse_keyword(*, mv_min: int = 30, mv_max: int = 300, limit_up_days: int = 15, exclude_st: bool = True, profit_min: float | None = None, profit_max: float | None = None, min_turnover: float | None = None, min_volume_ratio: float | None = None, ma_up: bool = True, chip: bool = True) -> str:
     parts = []
     if exclude_st: parts.append("非ST")
@@ -207,16 +212,41 @@ def screen_liumei(**kw) -> dict:
 # 模块一.5：本地精算引擎 (柚子六脉)
 # ==========================================
 def get_kline(code: str):
-    """获取某只股票过去30天的日K数据（前复权）"""
+    """利用妙想 query 接口获取某只股票过去30天的日K数据"""
     pure_code = code.replace("sh", "").replace("sz", "").replace("SH", "").replace("SZ", "")
     end_date = datetime.date.today().strftime("%Y%m%d")
     start_date = (datetime.date.today() - datetime.timedelta(days=30)).strftime("%Y%m%d")
     
     try:
-        df = ak.stock_zh_a_hist(
-            symbol=pure_code, period="daily", start_date=start_date, 
-            end_date=end_date, adjust="qfq"
-        )
+        # 调用妙想的 query 接口查询历史行情
+        query_str = f"{pure_code} {start_date}到{end_date} 日K线 收盘价 成交量"
+        res = query(query_str)
+        
+        # 妙想返回的数据可能是 Markdown 表格，我们用写好的 _parse_md_table 解析
+        md = res.get("partialResults")
+        if not md:
+            return None
+            
+        cols, rows = _parse_md_table(md)
+        if not rows:
+            return None
+            
+        # 转换为 Pandas DataFrame，并适配算法列名
+        df = pd.DataFrame(rows)
+        
+        # 重命名列，确保是 '收盘' 和 '成交量'
+        column_mapping = {}
+        for c in df.columns:
+            if '收盘' in c or 'close' in c.lower(): column_mapping[c] = '收盘'
+            if '成交量' in c or 'volume' in c.lower(): column_mapping[c] = '成交量'
+        
+        df = df.rename(columns=column_mapping)
+        
+        # 确保数据类型正确，防止计算报错
+        df['收盘'] = pd.to_numeric(df['收盘'], errors='coerce')
+        df['成交量'] = pd.to_numeric(df['成交量'], errors='coerce')
+        df = df.dropna()
+        
         return df
     except Exception as e:
         print(f"获取 {code} 的K线数据失败: {e}")
@@ -226,11 +256,13 @@ def local_filter_liumei(candidates: list[dict]) -> list[dict]:
     """接收妙想粗筛出的候选池，用历史K线计算真正的 C1-C6"""
     final_results = []
     
-    for stock in candidates:
+    # 每次最多处理前20只，防止超时
+    for stock in candidates[:20]:
         code = stock.get('code')
         df = get_kline(code)
+        
         if df is None or len(df) < 20:
-            # 如果数据拉取失败，暂时保留原始数据（方便你排查是接口问题还是算法问题）
+            # 如果数据拉取失败，保留原始数据，标记为数据不足
             stock['score'] = 0
             stock['rating'] = '数据不足'
             final_results.append(stock)
@@ -305,12 +337,13 @@ async def screen_stocks(req: ScreenRequest):
             "code": 200, 
             "msg": "success", 
             "data_date": coarse_data.get('data_date'), 
-            "total": len(final_data), 
+            "total": len(final_data),修改 
             "data": final_data
         }
-    except MiaoXiangError as e:
-        raise HTTPException(status_code=400, detail=f"妙想API调用失败: {e.message}")
+    except M。
+iaoX2iangError as e:
+        raise HTTPException(status_code=.400, detail=f"妙想API调用失败 : {e.message}")
 
-if __name__ == "__main__":
+if __name__ == "__回到main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=8000)
