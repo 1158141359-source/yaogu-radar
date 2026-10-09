@@ -1,0 +1,315 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>柚子六脉 · 短线量化终端</title>
+    <style>
+        :root {
+            --bg-color: #0b0e11;
+            --card-bg: #1e2329;
+            --card-bg-high: #2c1a1a; /* 高分红色背景 */
+            --text-main: #eaecef;
+            --text-sub: #848e9c;
+            --gold: #f0b90b;
+            --red: #f6465d;
+            --green: #0ecb81;
+        }
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+            -webkit-tap-highlight-color: transparent;
+        }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            background-color: var(--bg-color);
+            color: var(--text-main);
+            padding-bottom: 20px;
+        }
+        /* 顶部导航栏 */
+        .header {
+            position: sticky;
+            top: 0;
+            background-color: var(--bg-color);
+            padding: 15px 20px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            border-bottom: 1px solid #2b3139;
+            z-index: 10;
+        }
+        .header h1 {
+            font-size: 18px;
+            font-weight: 600;
+            color: var(--gold);
+        }
+        .header .date {
+            font-size: 12px;
+            color: var(--text-sub);
+        }
+        /* 列表容器 */
+        .stock-list {
+            padding: 15px;
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+        }
+        /* 股票卡片 */
+        .card {
+            background-color: var(--card-bg);
+            border-radius: 12px;
+            padding: 16px;
+            border: 1px solid #2b3139;
+            position: relative;
+            transition: all 0.2s ease;
+        }
+        /* 高分高亮样式 */
+        .card.high-score {
+            background-color: var(--card-bg-high);
+            border: 1px solid var(--red);
+            box-shadow: 0 0 10px rgba(246, 70, 93, 0.2);
+        }
+        .card.high-score::after {
+            content: "高分";
+            position: absolute;
+            top: -8px;
+            right: 15px;
+            background-color: var(--red);
+            color: white;
+            font-size: 10px;
+            padding: 2px 6px;
+            border-radius: 4px;
+            font-weight: bold;
+        }
+        
+        .card-top {
+            display: flex;
+            justify-content: space-between;
+            align-items: flex-start;
+            margin-bottom: 12px;
+        }
+        .card-title {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+        .card-title h2 {
+            font-size: 17px;
+            font-weight: 600;
+        }
+        .card-title .code {
+            font-size: 13px;
+            color: var(--text-sub);
+            background: #2b3139;
+            padding: 2px 6px;
+            border-radius: 4px;
+        }
+        .rating-tag {
+            font-size: 11px;
+            padding: 2px 6px;
+            border-radius: 4px;
+            font-weight: bold;
+            border: 1px solid currentColor;
+        }
+        .rating-S { color: var(--red); background: rgba(246, 70, 93, 0.1); }
+        .rating-A { color: var(--gold); background: rgba(240, 185, 11, 0.1); }
+        .rating-B { color: var(--text-sub); background: rgba(132, 142, 156, 0.1); }
+        .rating-C { color: #666; background: rgba(102, 102, 102, 0.1); }
+
+        .score-box {
+            display: flex;
+            flex-direction: column;
+            align-items: flex-end;
+        }
+        .score-box .score {
+            font-size: 24px;
+            font-weight: 800;
+            color: var(--gold);
+            line-height: 1;
+        }
+        .high-score .score { color: var(--red); }
+        .score-box .label {
+            font-size: 11px;
+            color: var(--text-sub);
+            margin-top: 4px;
+        }
+
+        /* 数据网格 */
+        .card-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr 1fr 1fr;
+            gap: 10px;
+            border-top: 1px solid #2b3139;
+            padding-top: 12px;
+        }
+        .high-score .card-grid { border-top-color: rgba(246, 70, 93, 0.3); }
+        
+        .data-item {
+            display: flex;
+            flex-direction: column;
+            gap: 4px;
+        }
+        .data-item .label {
+            font-size: 11px;
+            color: var(--text-sub);
+        }
+        .data-item .value {
+            font-size: 13px;
+            font-weight: 500;
+        }
+        /* A股涨跌颜色 */
+        .chg-positive { color: var(--red); }
+        .chg-negative { color: var(--green); }
+        .chg-zero { color: var(--text-sub); }
+
+        /* 状态提示 */
+        .loading, .error, .empty {
+            text-align: center;
+            padding: 40px 20px;
+            color: var(--text-sub);
+            font-size: 14px;
+        }
+        .error { color: var(--red); }
+        .empty { color: var(--gold); }
+        
+        .spinner {
+            display: inline-block;
+            width: 20px;
+            height: 20px;
+            border: 3px solid rgba(255,255,255,0.1);
+            border-radius: 50%;
+            border-top-color: var(--gold);
+            animation: spin 1s ease-in-out infinite;
+            margin-bottom: 10px;
+        }
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+    </style>
+</head>
+<body>
+
+    <div class="header">
+        <h1>⚡ 柚子六脉</h1>
+        <div class="date" id="data-date">数据加载中...</div>
+    </div>
+
+    <div class="stock-list" id="stock-list">
+        <div class="loading">
+            <div class="spinner"></div>
+            <div>正在连接云端服务器...<br>首次唤醒可能需要1-2分钟，请耐心等待</div>
+        </div>
+    </div>
+
+    <script>
+        const API_URL = 'https://yaogu-radar-1.onrender.com/api/screen';
+
+        async function fetchStockData() {
+            const listContainer = document.getElementById('stock-list');
+            const dateContainer = document.getElementById('data-date');
+
+            try {
+                const response = await fetch(API_URL, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({
+                        mv_min: 30,
+                        mv_max: 300,
+                        profit_min: 60,
+                        profit_max: 85
+                    })
+                });
+
+                if (!response.ok) {
+                    throw new Error(`接口返回错误: ${response.status}`);
+                }
+
+                const result = await response.json();
+                
+                if (result.code !== 200) {
+                    throw new Error(result.msg || '接口返回异常');
+                }
+
+                dateContainer.textContent = `更新: ${result.data_date || '无'}`;
+
+                const stocks = result.data;
+                if (!stocks || stocks.length === 0) {
+                    listContainer.innerHTML = '<div class="empty">今日暂无符合条件股票</div>';
+                    return;
+                }
+
+                renderStocks(stocks, listContainer);
+
+            } catch (error) {
+                console.error(error);
+                listContainer.innerHTML = `<div class="error">
+                    连接失败：${error.message}<br><br>
+                    提示：Render免费服务可能正在休眠，请下拉刷新重试。
+                </div>`;
+            }
+        }
+
+        function renderStocks(stocks, container) {
+            container.innerHTML = ''; // 清空加载提示
+
+            stocks.forEach(stock => {
+                const score = stock.score || 0;
+                const rating = stock.rating || 'B';
+                const isHighScore = score >= 90;
+                
+                // 处理涨跌颜色
+                const chg = stock.chg || 0;
+                let chgClass = 'chg-zero';
+                let chgSign = '';
+                if (chg > 0) { chgClass = 'chg-positive'; chgSign = '+'; }
+                if (chg < 0) { chgClass = 'chg-negative'; }
+
+                // 处理评级标签样式
+                const ratingClass = `rating-${rating}`;
+
+                const card = document.createElement('div');
+                card.className = `card ${isHighScore ? 'high-score' : ''}`;
+                
+                card.innerHTML = `
+                    <div class="card-top">
+                        <div class="card-title">
+                            <h2>${stock.name || '未知'}</h2>
+                            <span class="code">${stock.code || ''}</span>
+                            <span class="rating-tag ${ratingClass}">${rating === 'S' ? '严格命中' : (rating === 'A' ? '重点关注' : '观察')}</span>
+                        </div>
+                        <div class="score-box">
+                            <div class="score">${score}</div>
+                            <div class="label">妖股指数</div>
+                        </div>
+                    </div>
+                    <div class="card-grid">
+                        <div class="data-item">
+                            <span class="label">涨跌幅</span>
+                            <span class="value ${chgClass}">${chgSign}${chg.toFixed(2)}%</span>
+                        </div>
+                        <div class="data-item">
+                            <span class="label">换手率</span>
+                            <span class="value">${(stock.turnover_rate || 0).toFixed(2)}%</span>
+                        </div>
+                        <div class="data-item">
+                            <span class="label">量比</span>
+                            <span class="value">${(stock.volume_ratio || 0).toFixed(2)}</span>
+                        </div>
+                        <div class="data-item">
+                            <span class="label">获利盘</span>
+                            <span class="value">${(stock.profit_ratio || 0).toFixed(2)}%</span>
+                        </div>
+                    </div>
+                `;
+                container.appendChild(card);
+            });
+        }
+
+        // 页面加载时执行
+        window.onload = fetchStockData;
+    </script>
+</body>
+</html>
