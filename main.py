@@ -218,35 +218,23 @@ def get_kline(code: str):
     start_date = (datetime.date.today() - datetime.timedelta(days=30)).strftime("%Y%m%d")
     
     try:
-        # 调用妙想的 query 接口查询历史行情
         query_str = f"{pure_code} {start_date}到{end_date} 日K线 收盘价 成交量"
         res = query(query_str)
-        
-        # 妙想返回的数据可能是 Markdown 表格，我们用写好的 _parse_md_table 解析
         md = res.get("partialResults")
         if not md:
             return None
-            
         cols, rows = _parse_md_table(md)
         if not rows:
             return None
-            
-        # 转换为 Pandas DataFrame，并适配算法列名
         df = pd.DataFrame(rows)
-        
-        # 重命名列，确保是 '收盘' 和 '成交量'
         column_mapping = {}
         for c in df.columns:
             if '收盘' in c or 'close' in c.lower(): column_mapping[c] = '收盘'
             if '成交量' in c or 'volume' in c.lower(): column_mapping[c] = '成交量'
-        
         df = df.rename(columns=column_mapping)
-        
-        # 确保数据类型正确，防止计算报错
         df['收盘'] = pd.to_numeric(df['收盘'], errors='coerce')
         df['成交量'] = pd.to_numeric(df['成交量'], errors='coerce')
         df = df.dropna()
-        
         return df
     except Exception as e:
         print(f"获取 {code} 的K线数据失败: {e}")
@@ -256,13 +244,11 @@ def local_filter_liumei(candidates: list[dict]) -> list[dict]:
     """接收妙想粗筛出的候选池，用历史K线计算真正的 C1-C6"""
     final_results = []
     
-    # 每次最多处理前20只，防止超时
     for stock in candidates[:20]:
         code = stock.get('code')
         df = get_kline(code)
         
         if df is None or len(df) < 20:
-            # 如果数据拉取失败，保留原始数据，标记为数据不足
             stock['score'] = 0
             stock['rating'] = '数据不足'
             final_results.append(stock)
@@ -289,13 +275,13 @@ def local_filter_liumei(candidates: list[dict]) -> list[dict]:
         if c4_cond: score += 16.6
         if c5_cond: score += 16.6
         
-        score += 33.2  # C2和C6粗筛已过滤，默认给分
+        score += 33.2 
         
         profit_ratio = stock.get('profit_ratio', 0)
         if profit_ratio > 85 or profit_ratio < 60:
-            score = min(score, 50) # 筹码不健康，强制降级
+            score = min(score, 50) 
         if not c5_cond:
-            score = min(score, 65) # 抛压不合格，强制降级
+            score = min(score, 65) 
             
         stock['score'] = round(score, 1)
         stock['rating'] = 'S' if score >= 85 else ('A' if score >= 65 else 'B')
@@ -323,27 +309,23 @@ def read_root():
 @app.post("/api/screen")
 async def screen_stocks(req: ScreenRequest):
     try:
-        # 1. 调用妙想粗筛
         coarse_data = screen_liumei(
             mv_min=req.mv_min, mv_max=req.mv_max,
             profit_min=req.profit_min, profit_max=req.profit_max
         )
         
-        # 2. 传入本地精算引擎
         final_data = local_filter_liumei(coarse_data.get('rows', []))
         
-        # 3. 返回精算后的最终结果
         return {
             "code": 200, 
             "msg": "success", 
             "data_date": coarse_data.get('data_date'), 
-            "total": len(final_data),修改 
+            "total": len(final_data), 
             "data": final_data
         }
-    except M。
-iaoX2iangError as e:
-        raise HTTPException(status_code=.400, detail=f"妙想API调用失败 : {e.message}")
+    except MiaoXiangError as e:
+        raise HTTPException(status_code=400, detail=f"妙想API调用失败: {e.message}")
 
-if __name__ == "__回到main__":
+if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=8000)
