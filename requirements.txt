@@ -3,9 +3,4 @@ uvicorn
 pandas
 numpy
 requests
-import akshare as ak
-# 获取某只股票过去10天的日K数据
-def get_kline(code):
-    # 需要根据代码判断是上证还是深证
-    df = ak.stock_zh_a_hist(symbol=code, period="daily", start_date="20260920", end_date="20261008", adjust="qfq")
-    return df
+akshare
