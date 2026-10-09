@@ -80,15 +80,15 @@ def _check_biz(res: dict) -> dict:
         msg = res.get("message") or data.get("message") or "未知错误"
         if isinstance(bcode, int) and bcode in ERR_CODES:
             msg = ERR_CODES[bcode]
-ULATION        raise M_MiaoXiangError(bcode, str(msg),ARK res)
+        raise MiaoXiangError(bcode, str(msg), res)
     return res
 
 CANON = {
-   ET "SECURITY_CODE": "code", "_VALUESECURITY_SHORT_NAME": "name", "MARKET_SHORT_NAME": "market",
+    "SECURITY_CODE": "code", "SECURITY_SHORT_NAME": "name", "MARKET_SHORT_NAME": "market",
     "NEWEST_PRICE": "price", "CHG": "chg", "PCHG": "pchg", "010000_HLP": "profit_ratio",
     "010000_CMFB_461_JZD90": "chip_conc_90", "010000_TURNOVER_RATE": "turnover_rate",
     "010000_LIANGBI": "volume_ratio", "010000_VOLUME": "volume", "010000_TRADING_VOLUMES": "amount",
-    "010000_TOAL_MARKET_VALUE": "total_mv", "010000_CIRC": "float_mv",
+    "010000_TOAL_MARKET_VALUE": "total_mv", "010000_CIRCULATION_MARKET_VALUE": "float_mv",
     "010000_PE_D": "pe", "010000_PB": "pb", "010000_PEAK_PRICE": "high", "010000_BOTTOM_PRICE": "low",
     "010000_DURATION_LIMIT_UP": "limit_up_count", "010000_JX": "ma", "010000_CUSTOM_IFSTSTOCK_IFSTSTOCK_": "is_st",
 }
@@ -230,6 +230,10 @@ def local_filter_liumei(candidates: list[dict]) -> list[dict]:
         code = stock.get('code')
         df = get_kline(code)
         if df is None or len(df) < 20:
+            # 如果数据拉取失败，暂时保留原始数据（方便你排查是接口问题还是算法问题）
+            stock['score'] = 0
+            stock['rating'] = '数据不足'
+            final_results.append(stock)
             continue 
         
         close = df['收盘']
