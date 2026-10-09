@@ -2,10 +2,9 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from fastapi.responses import RedirectResponse
 import os
 import json
-import datetime
-import pandas as pd
 import re
 import time
 import urllib.error
@@ -184,11 +183,6 @@ def stock_screen(keyword: str, page_no: int = 1, page_size: int = 50, api_key: s
         if len(meta) == 10 and meta[4] == "-": out["data_date"] = meta; break
     return out
 
-def query(tool_query: str, api_key: str | None = None) -> dict:
-    """自然语言查数（历史行情、财务等）"""
-    res = _check_biz(call("/api/claw/query", {"toolQuery": tool_query}, api_key=api_key))
-    return _dig(res, "data", "data") or {}
-
 def liumei_coarse_keyword(*, mv_min: int = 30, mv_max: int = 300, limit_up_days: int = 15, exclude_st: bool = True, profit_min: float | None = None, profit_max: float | None = None, min_turnover: float | None = None, min_volume_ratio: float | None = None, ma_up: bool = True, chip: bool = True) -> str:
     parts = []
     if exclude_st: parts.append("非ST")
@@ -209,84 +203,76 @@ def screen_liumei(**kw) -> dict:
 
 
 # ==========================================
-# 模块一.5：本地精算引擎 (柚子六脉)
+# 模块一.5：本地精算引擎 (无K线纯API打分版)
 # ==========================================
-def get_kline(code: str):
-    """利用妙想 query 接口获取某只股票过去30天的日K数据"""
-    pure_code = code.replace("sh", "").replace("sz", "").replace("SH", "").replace("SZ", "")
-    end_date = datetime.date.today().strftime("%Y%m%d")
-    start_date = (datetime.date.today() - datetime.timedelta(days=30)).strftime("%Y%m%d")
-    
-    try:
-        query_str = f"{pure_code} {start_date}到{end_date} 日K线 收盘价 成交量"
-        res = query(query_str)
-        md = res.get("partialResults")
-        if not md:
-            return None
-        cols, rows = _parse_md_table(md)
-        if not rows:
-            return None
-        df = pd.DataFrame(rows)
-        column_mapping = {}
-        for c in df.columns:
-            if '收盘' in c or 'close' in c.lower(): column_mapping[c] = '收盘'
-            if '成交量' in c or 'volume' in c.lower(): column_mapping[c] = '成交量'
-        df = df.rename(columns=column_mapping)
-        df['收盘'] = pd.to_numeric(df['收盘'], errors='coerce')
-        df['成交量'] = pd.to_numeric(df['成交量'], errors='coerce')
-        df = df.dropna()
-        return df
-    except Exception as e:
-        print(f"获取 {code} 的K线数据失败: {e}")
-        return None
-
 def local_filter_liumei(candidates: list[dict]) -> list[dict]:
-    """接收妙想粗筛出的候选池，用历史K线计算真正的 C1-C6"""
+    """接收妙想粗筛出的候选池，直接基于API截面数据打分"""
     final_results = []
     
-    for stock in candidates[:20]:
-        code = stock.get('code')
-        df = get_kline(code)
-        
-        if df is None or len(df) < 20:
-            stock['score'] = 0
-            stock['rating'] = '数据不足'
-            final_results.append(stock)
-            continue 
-        
-        close = df['收盘']
-        volume = df['成交量']
-        
-        ma5 = close.rolling(5).mean()
-        ma10 = close.rolling(10).mean()
-        ma20 = close.rolling(20).mean()
-        
-        c1_cond = all(close.tail(5) > ma5.tail(5)) and (5 <= (close.iloc[-1] / close.iloc[-6] - 1) * 100 <= 15)
-        c3_cond = (ma5.iloc[-1] > ma10.iloc[-1] > ma20.iloc[-1]) and (close.iloc[-1] > ma5.iloc[-1])
-        
-        vol_ma5 = volume.rolling(5).mean()
-        c4_cond = 1.3 <= (vol_ma5.iloc[-1] / vol_ma5.iloc[-6]) <= 1.8
-        
-        c5_cond = (volume.iloc[-2] < volume.iloc[-3] * 0.7) and (-3 < (close.iloc[-2] / close.iloc[-3] - 1) * 100 < 0)
-        
+    for stock in candidates:
+        # 基础分数
         score = 0
-        if c1_cond: score += 16.6
-        if c3_cond: score += 16.6
-        if c4_cond: score += 16.6
-        if c5_cond: score += 16.6
         
-        score += 33.2 
-        
-        profit_ratio = stock.get('profit_ratio', 0)
-        if profit_ratio > 85 or profit_ratio < 60:
-            score = min(score, 50) 
-        if not c5_cond:
-            score = min(score, 65) 
+        # 1. 盘口强度（今日涨跌幅，20分）
+        chg = stock.get('chg', 0)
+        if chg > 0 and chg < 7:
+            score += 20
+        elif chg >= 7:
+            score += 10 # 涨幅过大容易透支
             
+        # 2. 抛压控制（今日量比，20分）
+        # 量比适中（1.0 - 2.5），说明交投活跃但不是天量出货
+        vol_ratio = stock.get('volume_ratio', 0)
+        if 1.0 <= vol_ratio <= 2.5:
+            score += 20
+        elif vol_ratio > 2.5:
+            score += 10 # 量能过大，警惕
+            
+        # 3. 筹码锁定（获利盘，20分）
+        profit_ratio = stock.get('profit_ratio', 0)
+        if 60 <= profit_ratio <= 85:
+            score += 20
+        elif profit_ratio > 85:
+            score += 10 # 获利盘太高，有兑现风险
+            
+        # 4. 涨停基因（20分）
+        limit_up = stock.get('limit_up_count', 0)
+        if limit_up >= 1:
+            score += 20
+            
+        # 5. 守线（价格在5日均线之上，20分）
+        extra = stock.get('extra', {})
+        ma5_str = extra.get('5日均线(元)')
+        price = stock.get('price', 0)
+        if ma5_str:
+            try:
+                ma5 = float(ma5_str)
+                if price > ma5:
+                    score += 20
+                else:
+                    score += 5 # 跌破5日线，减分
+            except:
+                score += 10
+        else:
+            score += 10 # 没有均线数据，给基础分
+            
+        # 封装最终结果
         stock['score'] = round(score, 1)
-        stock['rating'] = 'S' if score >= 85 else ('A' if score >= 65 else 'B')
+        
+        # 评级标准
+        if score >= 90:
+            stock['rating'] = 'S'
+        elif score >= 70:
+            stock['rating'] = 'A'
+        elif score >= 50:
+            stock['rating'] = 'B'
+        else:
+            stock['rating'] = 'C'
+            
         final_results.append(stock)
         
+    # 按分数从高到低排序
+    final_results.sort(key=lambda x: x['score'], reverse=True)
     return final_results
 
 
@@ -302,23 +288,24 @@ class ScreenRequest(BaseModel):
     profit_min: float = 60
     profit_max: float = 85
 
-from fastapi.responses import RedirectResponse
-
 @app.get("/")
 def read_root():
     # 自动跳转到 /docs 文档页面
     return RedirectResponse(url="/docs")
-    
+
 @app.post("/api/screen")
 async def screen_stocks(req: ScreenRequest):
     try:
+        # 1. 调用妙想粗筛
         coarse_data = screen_liumei(
             mv_min=req.mv_min, mv_max=req.mv_max,
             profit_min=req.profit_min, profit_max=req.profit_max
         )
         
+        # 2. 传入无K线本地打分引擎
         final_data = local_filter_liumei(coarse_data.get('rows', []))
         
+        # 3. 返回打分排序后的结果
         return {
             "code": 200, 
             "msg": "success", 
