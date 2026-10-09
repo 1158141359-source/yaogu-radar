@@ -7,6 +7,10 @@ import json
 import datetime
 import akshare as ak
 
+
+# ==========================================
+# 模块一：妙想 API 客户端
+# ==========================================
 def get_kline(code: str):
     """获取某只股票过去30天的日K数据（前复权）"""
     # 1. 清洗股票代码（去掉 sh、sz 前缀，akshare 只需要纯数字）
@@ -29,9 +33,6 @@ def get_kline(code: str):
     except Exception as e:
         print(f"获取 {code} 的K线数据失败: {e}")
         return None
-# ==========================================
-# 模块一：妙想 API 客户端
-# ==========================================
 import re
 import time
 import urllib.error
