@@ -2,7 +2,7 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from fastapi.responses import RedirectResponse
+from fastapi.staticfiles import StaticFiles
 import os
 import json
 import re
@@ -288,11 +288,6 @@ class ScreenRequest(BaseModel):
     profit_min: float = 60
     profit_max: float = 85
 
-@app.get("/")
-def read_root():
-    # 自动跳转到 /docs 文档页面
-    return RedirectResponse(url="/docs")
-
 @app.post("/api/screen")
 async def screen_stocks(req: ScreenRequest):
     try:
@@ -315,6 +310,9 @@ async def screen_stocks(req: ScreenRequest):
         }
     except MiaoXiangError as e:
         raise HTTPException(status_code=400, detail=f"妙想API调用失败: {e.message}")
+
+# ⬇️ 新增：挂载当前目录下的静态文件（让根路径 / 直接显示 index.html）
+app.mount("/", StaticFiles(directory=".", html=True), name="static")
 
 if __name__ == "__main__":
     import uvicorn
